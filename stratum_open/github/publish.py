@@ -36,6 +36,11 @@ LABEL = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low
 # The hint under each inline comment, and the one 0.1 and 0.2 posted.
 HINT = "Reply `/stratum ignore` to hide it on this PR, or `/stratum explain` for more."
 OLD_HINT = "Reply `@stratum ignore` to hide it on this PR, or `@stratum explain` for more."
+# The hint where a reply can't reach Stratum: with the Action, on a PR from a
+# fork, GitHub runs a reply with a read-only token (#124). A comment on the
+# PR can, and the fingerprint names the finding there.
+FINGERPRINT_HINT = ("Comment `/stratum ignore {fp}` on this PR to hide it, or `/stratum explain {fp}` for more. "
+                    "A reply here can't reach Stratum on a PR from a fork.")
 # `review.early_checks`: the summary's line while the model reads the PR, and once it's clear it won't finish.
 EARLY_PENDING = "still running. This comment becomes the full review when it's done."
 EARLY_STOPPED = "didn't finish, so this review has only the checks. Comment `/stratum review` to run it again."
@@ -150,7 +155,9 @@ def _is_bot(comment: dict, bot: str) -> bool:
 # ── inline comments ──────────────────────────────────────────────────────
 
 
-def comment_body(finding: Finding, *, feedback: bool) -> str:
+def comment_body(finding: Finding, *, feedback: bool, by_fingerprint: bool = False) -> str:
+    """An inline comment. `by_fingerprint`: its hint names the finding's
+    fingerprint for a comment on the PR, where a reply can't be read."""
     lines = [f"**{LABEL[finding.severity]} · {finding.category}:** {finding.title}", "", finding.detail]
     if finding.suggestion:
         lines += ["", f"**Fix:** {finding.suggestion}"]
@@ -163,7 +170,7 @@ def comment_body(finding: Finding, *, feedback: bool) -> str:
         fence = "`" * max(3, longest + 1)
         lines += ["", f"{fence}suggestion", finding.replacement.rstrip("\n"), fence]
     source = f"a check (`{finding.rule}`)" if finding.source == "check" else "the model"
-    hint = f"From {source}. {HINT}"
+    hint = f"From {source}. {FINGERPRINT_HINT.format(fp=finding.fingerprint) if by_fingerprint else HINT}"
     if feedback:
         hint += " 👍 or 👎 tells Stratum whether this was useful."
     lines += ["", f"<sub>{hint}</sub>", f"<!-- stratum:finding {finding.fingerprint} {finding.rule} -->"]
@@ -207,7 +214,7 @@ def closed_body(body: str, reason: str) -> str:
 
 
 def publish_inline(gh: GitHub, number: int, head_sha: str, findings: list[Finding], threads: list[dict], *, bot: str, limit: int, feedback: bool,
-                   early: dict[str, dict] | None = None) -> list[str]:
+                   early: dict[str, dict] | None = None, by_fingerprint: bool = False) -> list[str]:
     """Post the anchored findings that don't have a thread yet. A thread a
     person resolved stays resolved: the finding isn't posted again.
 
@@ -215,7 +222,9 @@ def publish_inline(gh: GitHub, number: int, head_sha: str, findings: list[Findin
     fingerprint, left out of `threads`. The choice is made as if they weren't
     there; a chosen one is kept (its text made the same as this review's) and
     one not chosen is deleted, unless someone has replied to it. So the lines
-    end up as they would without the early post."""
+    end up as they would without the early post.
+
+    `by_fingerprint`: see `comment_body`."""
     existing: dict[str, dict] = {}
     for thread in threads:
         fp = thread_fingerprint(thread, bot)
@@ -227,11 +236,11 @@ def publish_inline(gh: GitHub, number: int, head_sha: str, findings: list[Findin
 
     fresh = [f for f in findings if f.anchored and (f.fingerprint not in existing or returned(f.fingerprint))]
     fresh = fresh[: max(0, limit - still_open)]
-    kept = _settle_early(gh, early, fresh, feedback) if early else []
+    kept = _settle_early(gh, early, fresh, feedback, by_fingerprint) if early else []
     fresh = [f for f in fresh if f.fingerprint not in kept]
     if not fresh:
         return kept
-    comments = [_inline(f, feedback) for f in fresh]
+    comments = [_inline(f, feedback, by_fingerprint) for f in fresh]
     try:
         gh.create_review(number, head_sha, comments)
         return kept + [f.fingerprint for f in fresh]
@@ -249,7 +258,7 @@ def publish_inline(gh: GitHub, number: int, head_sha: str, findings: list[Findin
     return posted
 
 
-def _settle_early(gh: GitHub, early: dict[str, dict], chosen: list[Finding], feedback: bool) -> list[str]:
+def _settle_early(gh: GitHub, early: dict[str, dict], chosen: list[Finding], feedback: bool, by_fingerprint: bool = False) -> list[str]:
     """The early threads this review keeps, by fingerprint; the others are
     deleted. A thread someone replied to is never deleted, and one GitHub
     won't delete or edit stays as it is."""
@@ -260,7 +269,7 @@ def _settle_early(gh: GitHub, early: dict[str, dict], chosen: list[Finding], fee
         try:
             if fp in wanted:
                 kept.append(fp)
-                body = comment_body(wanted[fp], feedback=feedback)
+                body = comment_body(wanted[fp], feedback=feedback, by_fingerprint=by_fingerprint)
                 if root.get("body") != body:
                     gh.edit_review_comment(root["id"], body)
             elif len(thread["comments"]) == 1:
@@ -270,8 +279,9 @@ def _settle_early(gh: GitHub, early: dict[str, dict], chosen: list[Finding], fee
     return kept
 
 
-def _inline(finding: Finding, feedback: bool) -> dict[str, Any]:
-    comment: dict[str, Any] = {"path": finding.path, "line": finding.line_end, "side": "RIGHT", "body": comment_body(finding, feedback=feedback)}
+def _inline(finding: Finding, feedback: bool, by_fingerprint: bool = False) -> dict[str, Any]:
+    comment: dict[str, Any] = {"path": finding.path, "line": finding.line_end, "side": "RIGHT",
+                               "body": comment_body(finding, feedback=feedback, by_fingerprint=by_fingerprint)}
     if finding.line_start != finding.line_end:
         comment.update(start_line=finding.line_start, start_side="RIGHT")
     return comment

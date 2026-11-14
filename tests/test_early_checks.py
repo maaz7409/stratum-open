@@ -179,6 +179,24 @@ def test_a_check_finding_posted_early_is_not_posted_again():
     assert on.deleted == []
 
 
+def test_on_a_pr_from_a_fork_with_the_action_the_early_comments_name_their_fingerprint_too():
+    """The early post and the full review give a comment the same hint (#124),
+    so the review keeps the early comment as it is."""
+    gh = GitHub(diff=DIFF)
+    gh.pulls[7]["head"]["repo"] = {"full_name": "mallory/widget"}
+
+    def as_the_action(model):
+        return Context(gh=gh, policy=parse_policy(EARLY), model=model, bot=BOT, log=lambda line: None, fork_replies=False)
+
+    post_early(as_the_action(FakeModel()), 7)
+    early = {c["id"]: c["body"] for c in gh.review_comments_}
+    assert early and all("Comment `/stratum ignore " in body and publish.HINT not in body for body in early.values())
+    review_pull(as_the_action(FakeModel(model_answer())), 7)
+    assert {c["id"]: c["body"] for c in gh.review_comments_ if c["id"] in early} == early
+    assert not any(comment_id in early for comment_id, _ in gh.edited)
+    assert all(publish.HINT not in c["body"] for c in gh.review_comments_)
+
+
 def test_a_model_finding_that_replaces_a_check_finding_takes_its_place():
     # The model reports the SQL line more severely and in the check's category: the review keeps one finding there, the model's.
     sql = 'cur = conn.execute(f"SELECT * FROM users WHERE id = {user_id}")'

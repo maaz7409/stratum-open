@@ -8,7 +8,10 @@ from fakes import FakeGitHub, FakeModel
 from test_runner import DIFF, model_answer
 
 from stratum_open import action
+from stratum_open.github import publish
 from stratum_open.github.commands import parse
+from stratum_open.policy import parse_policy
+from stratum_open.runner import Context, review_pull
 
 
 def run(tmp_path, monkeypatch, event_name, payload, gh, model=None):
@@ -46,6 +49,48 @@ def test_comment_events_run_commands(tmp_path, monkeypatch):
                "comment": {"id": 1, "body": "/stratum help", "user": {"login": "erin", "type": "User"}}}
     run(tmp_path, monkeypatch, "issue_comment", payload, gh)
     assert "Stratum commands" in gh.issue_comments_[7][-1]["body"]
+
+
+def from_fork(gh, repo="mallory/widget"):
+    gh.pulls[7]["head"]["repo"] = {"full_name": repo} if repo else None
+    return gh
+
+
+def inline_hints(gh):
+    return [c["body"].rpartition("<sub>")[2] for c in gh.review_comments_]
+
+
+@pytest.mark.parametrize("repo", ["mallory/widget", None])  # None: the fork was deleted
+def test_on_a_pr_from_a_fork_the_inline_comments_name_their_fingerprint(tmp_path, monkeypatch, repo):
+    """A reply can't reach the Action on a PR from a fork (#124), so each
+    inline comment names the comment on the PR that does what the reply would."""
+    gh = from_fork(FakeGitHub(diff=DIFF), repo)
+    assert run(tmp_path, monkeypatch, "pull_request_target", pr_payload(), gh) == 0
+    hints = inline_hints(gh)
+    assert hints and all(publish.HINT not in hint for hint in hints)
+    for comment, hint in zip(gh.review_comments_, hints):
+        fp = publish._FINDING.search(comment["body"]).group(1)
+        assert publish.FINGERPRINT_HINT.format(fp=fp) in hint
+
+    # What the hint says to do works: a comment on the PR, which runs with the workflow's token.
+    gh.permissions["mona"] = "write"
+    fp = publish._FINDING.search(gh.review_comments_[0]["body"]).group(1)
+    payload = {"action": "created", "repository": {"default_branch": "main"}, "issue": {"number": 7, "pull_request": {}},
+               "comment": {"id": 2, "body": f"/stratum ignore {fp}", "user": {"login": "mona", "type": "User"}}}
+    assert run(tmp_path, monkeypatch, "issue_comment", payload, gh) == 0
+    assert fp in publish.State.decode(gh.issue_comments_[7][0]["body"]).ignored
+
+
+@pytest.mark.parametrize("fork", [False, True])
+def test_a_reply_is_still_the_hint_where_it_can_be_read(tmp_path, monkeypatch, fork):
+    """A PR from the repo itself, with the Action; and the App, which reads a reply on any PR."""
+    gh = from_fork(FakeGitHub(diff=DIFF), "mallory/widget" if fork else "Acme/Widget")
+    if fork:
+        review_pull(Context(gh=gh, policy=parse_policy(None), model=FakeModel(model_answer()), bot="stratum[bot]",
+                            log=lambda line: None, feedback=True), 7)
+    else:
+        run(tmp_path, monkeypatch, "pull_request_target", pr_payload(), gh)
+    assert gh.review_comments_ and all(publish.HINT in hint for hint in inline_hints(gh))
 
 
 def test_schedule_builds_the_queue(tmp_path, monkeypatch):

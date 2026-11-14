@@ -51,6 +51,9 @@ class Context:
     history_ref: str = "HEAD"  # the default branch inside `checkout`
     lookup: object | None = None  # registry lookups for the dependency check
     feedback: bool = False  # 👍/👎 counted (the App, which can store them)
+    # A reply in an inline thread on a PR from a fork reaches Stratum with a token
+    # that can write. Not with the Action: GitHub gives that run a read-only one.
+    fork_replies: bool = True
     own_checks: tuple[str, ...] = ()  # check runs of Stratum's own job, which aren't CI
     log: Callable[[str], None] = print
 
@@ -95,6 +98,18 @@ def skip_reason(pull: dict, action: str | None, policy: Policy) -> str | None:
     if branch and matches_any(branch, rules.skip_branches):
         return f"PRs from {branch} aren't reviewed (review.skip_branches)."
     return None
+
+
+def from_fork(pull: dict, repo: str) -> bool:
+    """Whether a PR's branch is in another repository. A fork that was deleted
+    leaves `head.repo` empty, which is still not this one."""
+    head = pull.get("head") or {}
+    return "repo" in head and ((head["repo"] or {}).get("full_name") or "").lower() != repo.lower()
+
+
+def _by_fingerprint(ctx: Context, pull: dict) -> bool:
+    """Whether inline comments name their fingerprint, since a reply to them can't be read (see Context.fork_replies)."""
+    return not ctx.fork_replies and from_fork(pull, ctx.gh.repo)
 
 
 def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = True, retry: bool = True) -> Outcome:
@@ -308,7 +323,7 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
             inline = publish.quiet_inline(inline, threads, bot=ctx.bot)
         posted = publish.publish_inline(gh, number, head, inline, threads, bot=ctx.bot,
                                         limit=policy.review.max_inline_comments, feedback=ctx.feedback or policy.review.learn_from_history,
-                                        **({"early": posted_early} if posted_early else {}))
+                                        by_fingerprint=_by_fingerprint(ctx, pull), **({"early": posted_early} if posted_early else {}))
     except GitHubError as exc:
         ctx.log(f"couldn't post inline comments: {exc}")
         problems.append(f"Couldn't post inline comments ({getattr(gh, 'platform', 'GitHub')} answered {exc.status}), so every finding is listed here instead.")
@@ -395,7 +410,8 @@ def post_early(ctx: Context, number: int) -> Outcome:
     try:
         threads = gh.review_threads(number)
         posted = publish.publish_inline(gh, number, head, placeable(findings, files), threads, bot=ctx.bot,
-                                        limit=policy.review.max_inline_comments, feedback=ctx.feedback or policy.review.learn_from_history)
+                                        limit=policy.review.max_inline_comments, feedback=ctx.feedback or policy.review.learn_from_history,
+                                        by_fingerprint=_by_fingerprint(ctx, pull))
     except GitHubError as exc:
         ctx.log(f"couldn't post the checks' inline comments: {exc}")
     on_lines = {publish.thread_fingerprint(t, ctx.bot) for t in threads if publish.is_open(t, ctx.bot)}
