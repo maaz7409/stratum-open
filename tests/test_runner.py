@@ -385,6 +385,69 @@ def test_ignore_a_rule_and_help_and_bots(gh):
     assert handle(ctx, event, payload) is None
 
 
+def finding_fingerprint(gh, title):
+    """The fingerprint in the hidden marker of the inline comment about `title`."""
+    body = next(c["body"] for c in gh.review_comments_ if title in c["body"])
+    return publish._FINDING.search(body).group(1)
+
+
+def test_a_comment_on_the_pr_ignores_one_finding_by_its_fingerprint(gh):
+    """On a PR from a fork, a reply in the thread can't reach the Action, so
+    the finding can be named in a comment on the PR instead (#124)."""
+    ctx = context(gh, FakeModel(model_answer()))
+    review_pull(ctx, 7)
+    gh.permissions["mona"] = "write"
+    fp = finding_fingerprint(gh, "Dead code")
+    assert handle(ctx, *comment_event(f"/stratum ignore {fp.upper()}", login="mona")) == "ignore"
+    state = publish.State.decode(gh.issue_comments_[7][0]["body"])
+    assert state.ignored == [fp] and state.ignored_rules == []
+    dead = next(t for t in gh.threads if "Dead code" in t["comments"][0]["body"])
+    assert dead["resolved"] and "Ignored on this PR." in dead["comments"][0]["body"]
+    unknown = next(t for t in gh.threads if "Unknown id" in t["comments"][0]["body"])
+    assert not unknown["resolved"]
+
+
+def test_a_fingerprint_that_isnt_on_the_pr_changes_nothing_and_says_so(gh):
+    ctx = context(gh, FakeModel(model_answer()))
+    review_pull(ctx, 7)
+    gh.permissions["mona"] = "write"
+    before = gh.issue_comments_[7][0]["body"]
+    assert handle(ctx, *comment_event("/stratum ignore 0123456789ab", login="mona")) == "ignore"
+    assert gh.issue_comments_[7][0]["body"] == before  # not kept as a rule nothing matches
+    assert "has no finding `0123456789ab` on this PR" in gh.issue_comments_[7][-1]["body"]
+
+
+def test_a_comment_on_the_pr_explains_one_finding_by_its_fingerprint(gh):
+    model = FakeModel(model_answer(), "Here's why: the string goes straight into SQL.")
+    ctx = context(gh, model)
+    review_pull(ctx, 7)
+    gh.files[("app/users.py", "a" * 40)] = "import sqlite3\n" * 10
+    fp = finding_fingerprint(gh, "Unknown id")
+    assert handle(ctx, *comment_event(f"/stratum explain {fp}", login="carol")) == "explain"  # the PR's author
+    posted = gh.issue_comments_[7][-1]["body"]
+    assert posted.startswith("Here's why") and posted.endswith("<!-- stratum:explained carol -->")
+    assert "Unknown id" in model.prompts[-1][1] and not gh.replies
+
+    calls = len(model.prompts)
+    assert handle(ctx, *comment_event("/stratum explain 0123456789ab", login="carol")) == "explain"
+    assert "has no finding" in gh.issue_comments_[7][-1]["body"] and len(model.prompts) == calls
+    assert handle(ctx, *comment_event("/stratum explain", login="carol")) == "explain"
+    assert "`/stratum explain <fingerprint>`" in gh.issue_comments_[7][-1]["body"] and len(model.prompts) == calls
+
+
+def test_explaining_by_fingerprint_counts_against_the_daily_limit(gh):
+    from stratum_open.github import commands
+
+    ctx = context(gh, FakeModel(model_answer(), *["An explanation."] * 10))
+    review_pull(ctx, 7)
+    gh.files[("app/users.py", "a" * 40)] = "x = 1\n"
+    fp = finding_fingerprint(gh, "Unknown id")
+    for _ in range(commands.EXPLAIN_PER_PERSON):
+        assert handle(ctx, *comment_event(f"/stratum explain {fp}", login="carol")) == "explain"
+    assert handle(ctx, *comment_event(f"/stratum explain {fp}", login="carol")) == "refused"
+    assert "Try again tomorrow" in gh.issue_comments_[7][-1]["body"]
+
+
 def test_explain_and_triage_commands(gh):
     ctx = context(gh, FakeModel(model_answer(), "Here's why: the string goes straight into SQL."))
     review_pull(ctx, 7)

@@ -37,6 +37,9 @@ NEEDS_MODEL = {"review", "re-review", "rereview", "ignore", "explain", "ask"}
 EXPLAIN_PER_PERSON = 5
 EXPLAIN_PER_PR = 20
 _EXPLAINED = re.compile(r"<!-- stratum:(?:explained|asked) (\S+) -->")
+# A finding's fingerprint, as its inline comment's hidden marker holds it. No
+# rule looks like one: a rule has a "/" or a "model:" prefix.
+FINGERPRINT = re.compile(r"[0-9a-f]{12}")
 MAX_QUESTION = 1000  # characters in a `/stratum ask` question
 
 HELP = """Stratum commands, at the start of a line in a comment on this PR:
@@ -44,6 +47,7 @@ HELP = """Stratum commands, at the start of a line in a comment on this PR:
 - `/stratum review`: review the whole PR again, not only what changed. *(write access)*
 - `/stratum ignore`: as a reply to one of Stratum's inline comments, hide that finding on this PR. *(write access)*
 - `/stratum ignore <rule>`: hide every finding of a rule on this PR, e.g. `/stratum ignore workflow/unpinned-action`. *(write access)*
+- `/stratum ignore <fingerprint>` / `/stratum explain <fingerprint>`: the same as the replies, for the finding with that fingerprint, as a comment on the PR. An inline comment names its fingerprint where a reply can't reach Stratum: on a PR from a fork, with the GitHub Action.
 - `/stratum mute <rule>` / `/stratum unmute <rule>`: hide a rule on every PR in this repo. Needs the GitHub App, which can store it. *(write access)*
 - `/stratum explain`: as a reply to an inline comment, explain that finding in more detail. *(the PR's author or write access; a few a day)*
 - `/stratum ask <question>`: answer a question about this PR from its diff and review; as a reply to an inline comment, about that comment's code. *(the PR's author or write access; counts with explain)*
@@ -113,14 +117,21 @@ def handle(ctx: Context, event: str, payload: dict) -> str | None:
             reply(f"`{arg}` is {'muted' if name == 'mute' else 'unmuted'} for every PR in this repo, from the next review on.")
         return name
     if name == "explain":
+        fp = None
         if not inline:
-            reply("Reply `/stratum explain` to one of Stratum's inline comments, and it explains that finding.")
-            return "explain"
+            if not FINGERPRINT.fullmatch(arg.lower()):
+                reply("Reply `/stratum explain` to one of Stratum's inline comments, and it explains that finding. "
+                      "Or name the finding: `/stratum explain <fingerprint>`.")
+                return "explain"
+            fp = arg.lower()
+            if _finding(ctx, number, fp) is None:
+                reply(_no_such_finding(fp))
+                return "explain"
         refusal = _explain_limit(ctx, number, author)
         if refusal:
             reply(refusal)
             return "refused"
-        reply(f"{_explain(ctx, number, thread_root)}\n<!-- stratum:explained {author.lower()} -->")
+        reply(f"{_explain(ctx, number, thread_root=thread_root if inline else None, fp=fp)}\n<!-- stratum:explained {author.lower()} -->")
         return "explain"
     if name == "ask":
         return _ask(ctx, number, author, f"{arg}\n{rest}".strip(), thread_root if inline else None, reply)
@@ -199,6 +210,11 @@ def _ignore(ctx: Context, number: int, rule: str, thread_root: int | None, reply
     elif not rule:
         reply("Reply `/stratum ignore` to one of Stratum's inline comments, or name a rule: `/stratum ignore <rule>`.")
         return "ignore"
+    elif FINGERPRINT.fullmatch(rule.lower()):  # one finding, named the way a reply would name it
+        fp = rule.lower()
+        if _finding(ctx, number, fp) is None:
+            reply(_no_such_finding(fp))
+            return "ignore"
     _record_ignore(gh, number, ctx.bot, fingerprint=fp, rule=None if fp else rule)
     review_pull(ctx, number, retry=False)  # resolves the thread and redraws the summary, with no model call
     return "ignore"
@@ -232,13 +248,35 @@ def _record_ignore(gh, number: int, bot: str, *, fingerprint: str | None, rule: 
         _pause(IGNORE_RECHECK_SECONDS)
 
 
-def _explain(ctx: Context, number: int, thread_root: int) -> str:
+def _finding(ctx: Context, number: int, fp: str) -> tuple[dict | None, dict] | None:
+    """The finding with this fingerprint on this PR, as the summary's state
+    keeps it (or None), and the inline comment Stratum started its thread with
+    (or {}). None when neither has it."""
     gh = ctx.gh
-    root = gh.review_comment(thread_root) or {}
-    fp = _fingerprint(root, ctx.bot)
     existing = publish.find_summary(gh.issue_comments(number), ctx.bot)
     state = publish.State.decode(existing["body"]) if existing else publish.State()
     finding = next((f for f in state.findings if f.get("fingerprint") == fp), None)
+    root = next((c for c in gh.review_comments(number) if not c.get("in_reply_to_id") and _fingerprint(c, ctx.bot) == fp), {})
+    return None if finding is None and not root else (finding, root)
+
+
+def _no_such_finding(fp: str) -> str:
+    return (f"Stratum has no finding `{fp}` on this PR, so nothing was changed. Check it against the inline comment that names it; "
+            "to hide every finding of a rule, use `/stratum ignore <rule>`.")
+
+
+def _explain(ctx: Context, number: int, *, thread_root: int | None = None, fp: str | None = None) -> str:
+    """An explanation of one finding: the one whose thread `thread_root`
+    starts, or the one with the fingerprint `fp`."""
+    gh = ctx.gh
+    if thread_root is not None:
+        root = gh.review_comment(thread_root) or {}
+        fp = _fingerprint(root, ctx.bot)
+        existing = publish.find_summary(gh.issue_comments(number), ctx.bot)
+        state = publish.State.decode(existing["body"]) if existing else publish.State()
+        finding = next((f for f in state.findings if f.get("fingerprint") == fp), None)
+    else:
+        finding, root = _finding(ctx, number, fp or "") or (None, {})
     if fp is None:
         return "That isn't one of Stratum's comments."
     if ctx.model is None:
