@@ -36,6 +36,10 @@ LABEL = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low
 # The hint under each inline comment, and the one 0.1 and 0.2 posted.
 HINT = "Reply `/stratum ignore` to hide it on this PR, or `/stratum explain` for more."
 OLD_HINT = "Reply `@stratum ignore` to hide it on this PR, or `@stratum explain` for more."
+# The command that sends a file the model stopped being sent on a commit again, as the summary
+# offers it next to a push. GitLab has no commands (a note doesn't start a pipeline), so
+# `gitlab_body` drops it there, and a push is the only way.
+RETRY_COMMAND = ", or comment `/stratum review`,"
 # The hint where a reply can't reach Stratum: with the Action, on a PR from a
 # fork, GitHub runs a reply with a read-only token (#124). A comment on the
 # PR can, and the fingerprint names the finding there.
@@ -95,6 +99,13 @@ class State:
     ignored_rules: list[str] = field(default_factory=list)
     triage: dict[str, Any] = field(default_factory=dict)
     unread: list[str] = field(default_factory=list)  # paths the model hasn't read at `head` (paths, not passes: each goes through every pass again)
+    # For each path in `unread`, in the same order: how many reviews of `head` sent it and got
+    # an answer that was cut off or wasn't the JSON asked for. A list, not a map, to keep the
+    # comment small; it's dropped on decode when it doesn't match `unread`.
+    tries: list[int] = field(default_factory=list)
+
+    def tries_by_path(self) -> dict[str, int]:
+        return dict(zip(self.unread, self.tries)) if len(self.tries) == len(self.unread) else {}
 
     def encode(self) -> str:
         data = asdict(self)
@@ -116,6 +127,7 @@ class State:
                 ignored_rules=[str(x) for x in data.get("ignored_rules", [])],
                 triage=data.get("triage") if isinstance(data.get("triage"), dict) else {},
                 unread=[str(x) for x in data.get("unread", []) if isinstance(x, str)],
+                tries=[n for n in data.get("tries", []) if isinstance(n, int) and not isinstance(n, bool) and n >= 0],
             )
         except (ValueError, TypeError, AttributeError):
             return cls()
@@ -353,6 +365,7 @@ class Summary:
     walkthrough: str = ""
     hidden: str = ""  # a line on the findings left out for being like ones maintainers rejected (review.learn_from_history)
     pending: str = ""  # `review.early_checks`: the checks alone, posted before the model has run; this says where the model is
+    label_held: str = ""  # why the triage label wasn't applied this time, though labels are on
 
 
 def render_summary(summary: Summary, state: State) -> str:
@@ -369,7 +382,8 @@ def render_summary(summary: Summary, state: State) -> str:
 
     if summary.triage is not None:
         label = label_for(summary.policy, summary.triage.key)
-        state_word = "" if summary.policy.triage.enabled else " (labels are off in this project's policy, so nothing was applied)"
+        state_word = (" (labels are off in this project's policy, so nothing was applied)" if not summary.policy.triage.enabled
+                      else f" (not applied: {summary.label_held})" if summary.label_held else "")
         lines.append(f"**Triage:** `{label}`{state_word}")
         lines += [f"- {reason}" for reason in summary.triage.reasons]
         if summary.triage.evidence:

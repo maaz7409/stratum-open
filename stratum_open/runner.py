@@ -33,11 +33,18 @@ MAX_CONTEXT_FILES = 20
 MAX_PROMISE_FILES = 20  # JavaScript and TypeScript files read in full for checks.floating_promises
 MAX_SCRIPT_FILES = 20  # shell scripts, and files that may be one, read in full for checks.shellcheck
 MAX_MOVED_FILES = 20  # files moved into a check's scope, which the checks read in full
+MAX_MOVED_TRIES = 3 * MAX_MOVED_FILES  # reads of such files, the binary ones included: each is an API call
 MAX_MOVED_BYTES = 1_000_000  # the contents API's own limit for a file's text
 MAX_REVIEW_TEXT_FILES = 20  # files whose text is fetched for review.context_lines
 # The JSON size of the unread paths kept in the summary's state (about 60 paths), so they don't crowd the
 # findings out of the comment; past it, the next run reads everything since the old head.
 MAX_UNREAD_BYTES = 4000
+# Reviews of one commit that may send a file and get no usable answer for it: one cut off or not
+# the JSON asked for, or a call that timed out or that the server refused (400, 413). Every event
+# on a commit (CI finishing, a reopen, a re-run) reviews it again, and each of these tends to
+# repeat for the same input, so after these the file waits for a push or for `/stratum review`.
+# A server that couldn't be reached, or kept failing (429, 5xx), doesn't count: an outage passes.
+MAX_UNUSABLE_TRIES = 2
 
 
 @dataclass
@@ -143,9 +150,12 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
     changed = None if full else since
     # `unread` records paths, not passes: a file read again goes through every
     # pass (per-file, lenses, chunked, verify, synthesis), even if one failed.
+    # The tries count only on the commit they were made on, and `/stratum
+    # review` (a full review) starts them again.
+    tries = state.tries_by_path() if state.head == head and not full else {}
     retried: set[str] = set()
     if changed is not None and reads:
-        retried = (set(state.unread) & set(paths)) - changed
+        retried = (set(state.unread) & set(paths)) - changed - {p for p, n in tries.items() if n >= MAX_UNUSABLE_TRIES}
         changed = changed | retried
     incremental = changed is not None
 
@@ -190,14 +200,21 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
     elif ctx.model is None:
         problems.append("No model is configured, so this review has only the checks.")
     large = engine.large
+    # The files sent this time whose answer came back cut off or not the JSON asked for, each
+    # with the reviews of this commit that have now had such an answer for it.
+    unusable = engine.unread & ((result.unusable if result else set()) | (large.unusable if large else set()))
+    counted = {p: tries.get(p, 0) + 1 for p in unusable}
     if large is not None:
         file_calls = [c for c in large.calls if c.get("pass") != "synthesis"]
         if large.failed_calls:
-            # A file the chunked review read in full isn't unread; one it didn't read is read again next time.
-            covered = not (large.unread & engine.unread)
+            # A file the chunked review read in full isn't unread; one it didn't read is read again next time,
+            # unless it has used up its tries on this commit.
+            missed = large.unread & engine.unread
+            again = {p for p in missed if counted.get(p, 0) < MAX_UNUSABLE_TRIES}
             problems.append(f"{large.failed_calls} of {len(file_calls)} per-file model calls failed; "
-                            + ("the chunked review still covered those files." if covered
-                               else "the next review reads again the ones the chunked review didn't read in full either."))
+                            + ("the chunked review still covered those files." if not missed
+                               else "the next review reads again the ones the chunked review didn't read in full either." if again
+                               else "the chunked review didn't read those files in full either."))
         if large.salvaged_calls:
             problems.append(f"{large.salvaged_calls} of the per-file replies were cut off; anything found after the cut is missing.")
 
@@ -217,18 +234,38 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
         left = engine.unread | (set(state.unread) - read - set(packed.omitted if packed else []))
     by_path = {f.path: f for f in files}
     unread = sorted(p for p in left if p in by_path and sendable(by_path[p], policy.ignored))
-    waiting = len(set(unread) - engine.unread) if ctx.model is not None else 0
+    # A file not sent this time keeps its count; one whose call failed some other way, too.
+    unread_tries = [counted.get(p, tries.get(p, 0)) for p in unread]
+    stopped = [p for p, n in zip(unread, unread_tries) if n >= MAX_UNUSABLE_TRIES] if ctx.model is not None else []
+    waiting = len(set(unread) - engine.unread - set(stopped)) if ctx.model is not None else 0
     if waiting:
         problems.append(f"The model hasn't read {_files(waiting)} yet; the next review reads {'it' if waiting == 1 else 'them'}.")
+    if stopped:
+        named = ", ".join(f"`{p}`" for p in stopped[:10]) + (f" and {len(stopped) - 10} more" if len(stopped) > 10 else "")
+        problems.append(f"Stopped sending {named} to the model on this commit: {MAX_UNUSABLE_TRIES} reviews of it got no usable "
+                        "answer (cut off, not the JSON asked for, timed out, or refused by the model server). "
+                        f"Push a commit{publish.RETRY_COMMAND} to try again.")
     # A review that left files unread isn't complete, whichever run failed to read them.
-    complete = engine.complete and not waiting
+    complete = engine.complete and not waiting and not stopped
 
+    # Each on its own: a failed CI lookup mustn't cost the linked issues. A
+    # failed one is unknown, never "none": CI stays None (as if pending), and
+    # the linked issues None, so the PR isn't called unlinked, or closed for it.
     facts = PRFacts.from_pull(pull, paths)
     try:
         facts.ci_ok = gh.ci_state(head, ignore={policy.review.check_name, *ctx.own_checks})
+    except GitHubError as exc:
+        problems.append(f"Couldn't read the CI status ({exc.status}).")
+    try:
         facts.linked_issues = gh.linked_issues(number)
     except GitHubError as exc:
-        problems.append(f"Couldn't read CI status or linked issues ({exc.status}).")
+        facts.linked_issues = None
+        problems.append(f"Couldn't read the linked issues ({exc.status}), so triage doesn't count them either way.")
+    # Under `require_linked_issue`, a label from a review that couldn't read the linked issues would
+    # say the PR meets a rule nobody checked. The PR keeps the label the last review that could read
+    # them gave it (none, on a first review), and the queue keeps that review's verdict.
+    held = ("this project asks for a linked issue, and this review couldn't read them, so the label stays as it was"
+            if policy.triage.require_linked_issue and facts.linked_issues is None else "")
 
     # Each `/stratum` command runs on its own, so an `ignore` can land while
     # this review was reading the PR: read the summary again before writing
@@ -278,7 +315,7 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
         matches_description=result.matches_description if result else "", mismatch=result.mismatch if result else "",
         triage=sorted_pr, notes=notes, coverage=coverage, problems=problems,
         muted=sorted(set(muted) | set(learned.rules)) if learned else muted,
-        **_walkthrough(large, findings), hidden=_hidden_line(hidden, learned, number),
+        **_walkthrough(large, findings), hidden=_hidden_line(hidden, learned, number), label_held=held,
     )
     # The next review reads what changed since this head, plus `unread`, so
     # it reads those again rather than calling a review it never finished
@@ -286,13 +323,14 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
     # and its `unread` instead, so the next run reads everything since it.
     # (Whatever failed this time was either changed since the old head or
     # already in its `unread`; anything else was read at the old head.)
-    keep_head = len(json.dumps(unread)) > MAX_UNREAD_BYTES
+    keep_head = len(json.dumps(unread)) + len(json.dumps(unread_tries)) > MAX_UNREAD_BYTES
     new_state = publish.State(
         head=state.head if keep_head else head,
         unread=state.unread if keep_head else unread,
+        tries=state.tries if keep_head else unread_tries,
         findings=[publish.state_finding(f, snippet_of(f, files)) for f in findings if f.source == "model"],
         ignored=state.ignored, ignored_rules=state.ignored_rules,
-        triage={**sorted_pr.as_dict(), "additions": facts.additions, "deletions": facts.deletions},
+        triage={**(state.triage if held else sorted_pr.as_dict()), "additions": facts.additions, "deletions": facts.deletions},
     )
     if not post:
         return Outcome(number, "dry-run", findings, sorted_pr, result, publish.render_summary(summary, new_state))
@@ -344,8 +382,10 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
     if policy.triage.enabled and not facts.draft:
         try:
             labels = [label.get("name", "") for label in pull.get("labels") or [] if isinstance(label, dict)]
-            publish.apply_label(gh, number, policy, sorted_pr.key, labels)
-            if policy.triage.close_without_issue and policy.triage.require_linked_issue and not facts.linked_issues and sorted_pr.key != "needs_human":
+            if not held:
+                publish.apply_label(gh, number, policy, sorted_pr.key, labels)
+            # Only on a lookup that worked and found none: a failed one is no reason to close a PR.
+            if policy.triage.close_without_issue and policy.triage.require_linked_issue and facts.unlinked and sorted_pr.key != "needs_human":
                 gh.comment(number, "Closing this PR: this project asks for every PR to link an issue (`Fixes #123`), and this one doesn't. "
                                    "Link one and reopen it, or ask a maintainer. Closed by Stratum under the project's `.stratum/policy.yml`.")
                 gh.close(number)
@@ -462,22 +502,40 @@ def stop_early(gh: GitHub, number: int, head: str, *, bot: str, name: str, run_i
 
 
 def _contents(ctx: Context, files: list[FileDiff], head: str, *, around: bool = False) -> dict[str, str] | None:
-    """The full new text of the files where the checks need context:
-    workflows and manifests always (they're small), Python files for Bandit
-    when it's installed (and for Ruff, when `checks.ruff` is on), and
-    otherwise the Python files whose change touches async code, for the
-    missing-await check. With `checks.floating_promises` on and its parser
-    installed, the JavaScript and TypeScript files that add a line starting
-    with a call. With `checks.shellcheck` on and ShellCheck on PATH, the
-    shell scripts, and the files with no extension that may be one (their
-    first line says). Files moved to where a check does more than where they
-    were, since the diff shows none of their lines as added (at most
-    MAX_MOVED_BYTES each; a bigger one is named as unread). With `around`
-    (the profile shows code around each hunk), the biggest changes the model
-    will read too."""
-    from stratum_open.checks import bandit, moved_in, promises, ruff, shellcheck
+    """The full new text of the files where the checks need context (see
+    `to_read`), fetched from GitHub."""
+
+    def read(file: FileDiff, max_bytes: int | None) -> str | None:
+        try:
+            return ctx.gh.file_text(file.path, head, max_bytes=max_bytes)
+        except GitHubError:
+            return None
+
+    fetch, moved = to_read(ctx.policy, files, around=around)
+    return read_contents(fetch, moved, read) or None
+
+
+def to_read(policy: Policy, files: list[FileDiff], *, around: bool = False) -> tuple[list[FileDiff], list[FileDiff]]:
+    """The files whose full new text the checks need, in the order to read
+    them, and the files moved to where a check does more than where they
+    were, beyond those, to read after them (see `read_contents`).
+
+    The first list: workflows and manifests always (they're small), Python
+    files for Bandit when it's installed (and for Ruff, when `checks.ruff` is
+    on), and otherwise the Python files whose change touches async code, for
+    the missing-await check. With `checks.floating_promises` on and its
+    parser installed, the JavaScript and TypeScript files that add a line
+    starting with a call. With `checks.shellcheck` on and ShellCheck on PATH,
+    the shell scripts, and the files with no extension that may be one (their
+    first line says). With `around` (the profile shows code around each
+    hunk), the biggest changes the model will read too.
+
+    The moved files are needed because the diff shows none of their lines as
+    added. The ones the checks gain most on come first, so a PR padded with
+    moved data files can't push a moved code file out."""
+    from stratum_open.checks import bandit, gained, moved_in, promises, ruff, shellcheck
     from stratum_open.checks.awaits import touches_async
-    from stratum_open.checks.common import looks_binary
+    from stratum_open.checks.common import moved_in as moved_into
     from stratum_open.checks.dependencies import manifest_kind
 
     def wanted(file: FileDiff) -> bool:
@@ -487,30 +545,59 @@ def _contents(ctx: Context, files: list[FileDiff], head: str, *, around: bool = 
 
     live = [f for f in files if f.status != "deleted" and not f.binary]
     fetch = [f for f in live if wanted(f)][:MAX_CONTEXT_FILES]
-    # The files Bandit reads first: a PR full of edited tests mustn't push the code out.
-    python = sorted((f for f in live if f.path.endswith(".py")), key=lambda f: (not bandit.scope(f.path), -f.additions))
-    whole = bandit.available() or (ctx.policy.checks.ruff and ruff.available())
+    # The files Bandit reads first, in bandit.plan's order: what the PR edits, then what it moved here.
+    # A PR full of edited tests, or of files moved with edits, mustn't push the code out.
+    python = sorted((f for f in live if f.path.endswith(".py")),
+                    key=lambda f: (not bandit.scope(f.path), moved_into(f, bandit.scope), -f.additions))
+    whole = bandit.available() or (policy.checks.ruff and ruff.available())
     fetch += (python if whole else [f for f in python if touches_async(f)])[:MAX_BANDIT_FILES]
-    if ctx.policy.checks.floating_promises and promises.available():
+    if policy.checks.floating_promises and promises.available():
         fetch += [f for f in live if promises.worth_reading(f)][:MAX_PROMISE_FILES]
-    if ctx.policy.checks.shellcheck and shellcheck.available():
+    if policy.checks.shellcheck and shellcheck.available():
         fetch += [f for f in live if shellcheck.worth_reading(f)][:MAX_SCRIPT_FILES]
-    moved = [f for f in live if moved_in(f)]  # the size cap and the binary test apply however they're fetched
-    fetch += [f for f in moved if f not in fetch][:MAX_MOVED_FILES]
+    # By path: comparing FileDiffs compares their hunks, which is slow on a PR that moves thousands of files.
+    taken = {f.path for f in fetch}
+    moved = sorted((f for f in live if f.path not in taken and moved_in(f)), key=lambda f: -gained(f))
     if around:
-        reviewed = sorted((f for f in live if not ctx.policy.ignored(f.path) and f not in fetch), key=lambda f: -(f.additions + f.deletions))
+        taken |= {f.path for f in moved}
+        reviewed = sorted((f for f in live if f.path not in taken and not policy.ignored(f.path)),
+                          key=lambda f: -(f.additions + f.deletions))
         fetch += reviewed[:MAX_REVIEW_TEXT_FILES]
+    return fetch, moved
+
+
+def read_contents(fetch: list[FileDiff], moved: list[FileDiff], read: Callable[[FileDiff, int | None], str | None]) -> dict[str, str]:
+    """The text of each file in `fetch`, then of the files in `moved` until
+    MAX_MOVED_FILES of them gave text, or MAX_MOVED_TRIES were tried.
+    `read(file, max_bytes)` gives a file's text, or None. A moved file is
+    read only up to MAX_MOVED_BYTES (a bigger one is named as unread), and
+    when its text turns out to be binary, it's marked binary and left out:
+    the diff couldn't tell, since a move with no edits looks the same either
+    way. A binary file doesn't count towards MAX_MOVED_FILES, so twenty of
+    them can't take every place, but it does count as a try."""
+    from stratum_open.checks import moved_in
+    from stratum_open.checks.common import looks_binary
+
     contents: dict[str, str] = {}
-    for file in fetch:
-        try:
-            text = ctx.gh.file_text(file.path, head, max_bytes=MAX_MOVED_BYTES if file in moved else None)
-        except GitHubError:
-            text = None
-        if text is not None and file in moved and looks_binary(text):
-            file.binary = True  # a moved file the diff couldn't call text or not
+
+    def keep(file: FileDiff) -> bool:
+        is_moved = moved_in(file)  # the size cap and the binary test apply however it's fetched
+        text = read(file, MAX_MOVED_BYTES if is_moved else None)
+        if text is not None and is_moved and looks_binary(text):
+            file.binary = True
         elif text is not None:
             contents[file.path] = text
-    return contents or None
+            return True
+        return False
+
+    for file in fetch:
+        keep(file)
+    kept = 0
+    for file in moved[:MAX_MOVED_TRIES]:
+        if kept == MAX_MOVED_FILES:
+            break
+        kept += keep(file)
+    return contents
 
 
 def _history(ctx: Context, files: list[FileDiff], pull: dict) -> tuple[list[str], set[str], list[Finding], dict[str, str]]:
@@ -678,24 +765,32 @@ def _coverage(result: ReviewResult | None, incremental: bool, changed: set[str] 
     moved = [f.path for f in files if moved_in(f) and f.path in contents]
     if moved:
         lines.append("Checked in full, since they moved to where the checks do more: " + ", ".join(f"`{p}`" for p in moved[:10]))
-    if bandit.available():
-        _, left_out = bandit.plan(files, contents)
-        if left_out:
-            lines.append(f"Not read by Bandit ({_files(len(left_out))} past its limit of {bandit.MAX_FILES}, or without their text): "
-                         + ", ".join(f"`{p}`" for p in left_out[:10]))
-    if policy is not None and policy.checks.ruff and ruff.available():
-        _, left_out = ruff.plan(files, contents)
-        if left_out:
-            lines.append(f"Not read by Ruff ({_files(len(left_out))} past its limit of {ruff.MAX_FILES}, too long, or without their text): "
-                         + ", ".join(f"`{p}`" for p in left_out[:10]))
-    for on, tool, name in ((policy is not None and policy.checks.shellcheck, shellcheck, "ShellCheck"),
+    for on, tool, name in ((True, bandit, "Bandit"),
+                           (policy is not None and policy.checks.ruff, ruff, "Ruff"),
+                           (policy is not None and policy.checks.shellcheck, shellcheck, "ShellCheck"),
                            (policy is not None and policy.checks.actionlint, actionlint, "actionlint")):
         if on and tool.available():
             _, left_out = tool.plan(files, contents)
             if left_out:
-                lines.append(f"Not read by {name} ({_files(len(left_out))} past its limit of {tool.MAX_FILES}, too long, or without their text): "
-                             + ", ".join(f"`{p}`" for p in left_out[:10]))
+                lines.append(_left_out_line(name, tool, left_out, contents))
     return lines
+
+
+def _left_out_line(name: str, tool: Any, left_out: list[str], contents: dict[str, str]) -> str:
+    """The coverage line for the files a tool would read but didn't, each
+    reason with its own files: the tool's own limit, a file too long for it
+    (`MAX_FILE_CHARS`, for the tools that have one), or no text to give it."""
+    longest = getattr(tool, "MAX_FILE_CHARS", None)
+    untexted = [p for p in left_out if p not in contents]
+    too_long = [p for p in left_out if p in contents and longest is not None and len(contents[p]) > longest]
+    past = [p for p in left_out if p not in untexted and p not in too_long]
+    parts = [
+        f"{_files(len(paths))} {reason} (" + ", ".join(f"`{p}`" for p in paths[:10]) + (", …" if len(paths) > 10 else "") + ")"
+        for paths, reason in ((past, f"past its limit of {tool.MAX_FILES}"), (too_long, f"over {longest or 0:,} characters"),
+                              (untexted, "whose text Stratum didn't have"))
+        if paths
+    ]
+    return f"Not read by {name}: " + "; ".join(parts)
 
 
 def _walkthrough(large: LargeReview | None, findings: list[Finding]) -> dict[str, Any]:
