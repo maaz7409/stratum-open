@@ -20,7 +20,7 @@ import requests
 from stratum_open.checks.dependencies import PackageLookup
 from stratum_open.github import publish
 from stratum_open.github.api import API, GitHub, GitHubError
-from stratum_open.github.commands import NEEDS_MODEL, handle, parse
+from stratum_open.github.commands import NEEDS_MODEL, handle, parse, unreadable_reply
 from stratum_open.model import model_from_policy
 from stratum_open.policy import Policy
 from stratum_open.runner import Context, checkout_ref, load_context_policy, post_early, review_pull, skip_reason, stop_early
@@ -120,6 +120,10 @@ def _run(env: Mapping[str, str], event_name: str, payload: dict, gh: GitHub, loa
                 stop_early(gh, pull["number"], (pull.get("head") or {}).get("sha", ""), bot=ctx.bot, name=policy.review.check_name,
                            run_id=_early_run(env), conclusion=env.get("STRATUM_EARLY_CONCLUSION", ""))
     elif event_name in ("issue_comment", "pull_request_review_comment"):
+        unreadable = unreadable_reply(ctx, event_name, payload)
+        if unreadable:  # the job fails: GitHub tells whoever started a run when it fails, and that is who wrote the reply
+            print(f"::error::{unreadable}")
+            return 1
         done = handle(ctx, event_name, payload)
         print(f"Command: {done or 'none in this comment'}")
     elif event_name == "workflow_run":

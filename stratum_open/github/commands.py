@@ -20,7 +20,7 @@ from stratum_open.diff import approx_tokens, parse_diff, render, sendable
 from stratum_open.github import publish
 from stratum_open.github.api import WRITE, GitHubError
 from stratum_open.review import demention, parse, parse_with_rest  # noqa: F401  (parse: re-exported) It lives next to demention(), which keeps model text from matching it
-from stratum_open.runner import Context, excluded, record_for, review_pull
+from stratum_open.runner import Context, excluded, from_fork, record_for, review_pull
 
 # The Action's answer to `/stratum mute`, which it can't store.
 MUTE_NEEDS_APP = ("Muting a rule for the whole repo needs somewhere to store it, so it works with the Stratum GitHub App. "
@@ -143,6 +143,36 @@ def handle(ctx: Context, event: str, payload: dict) -> str | None:
         return "record"
     reply(HELP)
     return "help"
+
+
+def unreadable_reply(ctx: Context, event: str, payload: dict) -> str | None:
+    """Why the command in this comment can't be run, and what to use instead;
+    None when it can. With the Action (see Context.fork_replies), GitHub runs
+    a reply in an inline thread on a PR from a fork with a read-only token:
+    every write is refused, the reply in the thread included, so the job log
+    is the only place left to say so (#124)."""
+    if event != "pull_request_review_comment" or ctx.fork_replies or payload.get("action") != "created":
+        return None
+    comment = payload.get("comment")
+    if not isinstance(comment, dict) or not comment.get("id") or not from_fork(payload.get("pull_request") or {}, ctx.gh.repo):
+        return None
+    user = comment.get("user") or {}
+    if not user.get("login") or user.get("type") == "Bot" or user["login"].lower() == ctx.bot.lower():
+        return None
+    parsed = parse_with_rest(comment.get("body") or "")
+    if parsed is None:
+        return None
+    name = parsed[0]
+    fp = None
+    if name in ("ignore", "explain"):
+        try:  # reading still works
+            fp = _fingerprint(ctx.gh.review_comment(comment.get("in_reply_to_id") or comment["id"]) or {}, ctx.bot)
+        except GitHubError:
+            pass
+    instead = f"`/stratum {name} {fp}`" if fp else "the same command"
+    return (f"`/stratum {name}` was a reply in an inline thread on a PR from a fork, and GitHub runs the Action for that with a "
+            "read-only token, so Stratum can't answer it or change anything. "
+            f"Post {instead} as a comment on the PR instead, not as a reply in a thread.")
 
 
 def _allowed(ctx: Context, command: str, login: str, number: int, reply) -> bool:

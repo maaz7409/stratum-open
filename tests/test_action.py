@@ -9,6 +9,7 @@ from test_runner import DIFF, model_answer
 
 from stratum_open import action
 from stratum_open.github import publish
+from stratum_open.github.api import GitHubError
 from stratum_open.github.commands import parse
 from stratum_open.policy import parse_policy
 from stratum_open.runner import Context, review_pull
@@ -91,6 +92,65 @@ def test_a_reply_is_still_the_hint_where_it_can_be_read(tmp_path, monkeypatch, f
     else:
         run(tmp_path, monkeypatch, "pull_request_target", pr_payload(), gh)
     assert gh.review_comments_ and all(publish.HINT in hint for hint in inline_hints(gh))
+
+
+def inline_reply(body, root_id, repo="mallory/widget", login="mona"):
+    return {"action": "created", "repository": {"default_branch": "main", "full_name": "acme/widget"},
+            "pull_request": {"number": 7, "head": {"repo": {"full_name": repo}}},
+            "comment": {"id": 3, "body": body, "in_reply_to_id": root_id, "user": {"login": login, "type": "User"}}}
+
+
+class Recording(FakeGitHub):
+    """Refuses every write, as GitHub does to a read-only token, and keeps the attempts."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.writes: list[str] = []
+
+    def refuse(self, name):
+        def write(*args, **kwargs):
+            self.writes.append(name)
+            raise GitHubError(403, "Resource not accessible by integration")
+        return write
+
+
+@pytest.mark.parametrize("body, instead", [
+    ("/stratum ignore", "`/stratum ignore {fp}`"),
+    ("Not this one.\n/stratum explain", "`/stratum explain {fp}`"),
+    ("/stratum review", "the same command"),
+])
+def test_a_reply_on_a_pr_from_a_fork_fails_the_run_and_says_what_to_use(tmp_path, monkeypatch, capsys, body, instead):
+    """#124: nothing can be written, so nothing is tried; the job's error line says why and what works."""
+    gh = Recording(diff=DIFF, permissions={"mona": "write"})
+    from_fork(gh)
+    run(tmp_path, monkeypatch, "pull_request_target", pr_payload(), gh)
+    root = gh.review_comments_[0]
+    fp = publish._FINDING.search(root["body"]).group(1)
+    summary = gh.issue_comments_[7][0]["body"]
+    capsys.readouterr()
+    for name in ("react", "reply", "comment", "edit_comment", "edit_review_comment", "check_run", "create_review", "resolve_thread"):
+        monkeypatch.setattr(gh, name, gh.refuse(name))
+
+    assert run(tmp_path, monkeypatch, "pull_request_review_comment", inline_reply(body, root["id"]), gh) == 1
+    out = capsys.readouterr().out
+    [error] = [line for line in out.splitlines() if line.startswith("::error::")]
+    assert "a reply in an inline thread on a PR from a fork" in error and instead.format(fp=fp) in error
+    assert "as a comment on the PR instead" in error and "403" not in out
+    assert gh.writes == [] and gh.issue_comments_[7][0]["body"] == summary
+
+
+def test_a_reply_that_isnt_a_command_or_is_on_the_repos_own_pr_runs_as_before(tmp_path, monkeypatch, capsys):
+    gh = FakeGitHub(diff=DIFF, permissions={"mona": "write"})
+    from_fork(gh, "acme/widget")
+    run(tmp_path, monkeypatch, "pull_request_target", pr_payload(), gh)
+    root = gh.review_comments_[0]
+    assert run(tmp_path, monkeypatch, "pull_request_review_comment", inline_reply("/stratum ignore", root["id"], "acme/widget"), gh) == 0
+    assert publish.State.decode(gh.issue_comments_[7][0]["body"]).ignored
+
+    from_fork(gh)
+    capsys.readouterr()
+    assert run(tmp_path, monkeypatch, "pull_request_review_comment", inline_reply("Thanks, see /stratum help.", root["id"]), gh) == 0
+    assert "::error::" not in capsys.readouterr().out
 
 
 def test_schedule_builds_the_queue(tmp_path, monkeypatch):
