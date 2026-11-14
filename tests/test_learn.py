@@ -101,6 +101,28 @@ def test_a_model_finding_is_hidden_by_its_fingerprint_once_voted_down_more_than_
     assert feedback.learn(gh, BOT).fingerprints == {"aaaaaaaaaaaa": [3]}
 
 
+def test_an_ignore_by_fingerprint_on_the_pr_counts_as_the_reply_would(gh):
+    """`/stratum ignore <fingerprint>` is the form for a PR from a fork (#124): a
+    vote against that finding and its rule, not a rule named after it."""
+    a = stratum_comment(fp="aaaaaaaaaaaa", rule="model:dead-code", pr=3)
+    gh.history_review_comments = [a]
+    gh.issue_comments_[3] = [{"id": next(_ids), "body": "/stratum ignore AAAAAAAAAAAA", "user": {"login": "mona"}}]
+    learned = feedback.learn(gh, BOT)
+    assert learned.fingerprints == {"aaaaaaaaaaaa": [3]} and learned.rules == {}
+
+    # On another PR the fingerprint names nothing, and isn't taken for a rule either.
+    gh.issue_comments_[4] = [{"id": next(_ids), "body": "/stratum ignore aaaaaaaaaaaa", "user": {"login": "lisa"}}]
+    learned = feedback.learn(gh, BOT)
+    assert learned.fingerprints == {"aaaaaaaaaaaa": [3]} and learned.rules == {}
+
+    # Five maintainers ignoring it by fingerprint mute its rule, as five replies would.
+    comments = [stratum_comment(fp=f"{n:012x}", rule="workflow/unpinned-action", pr=10 + n) for n in range(5)]
+    gh.history_review_comments = comments
+    gh.issue_comments_.update({10 + n: [{"id": next(_ids), "body": f"/stratum ignore {n:012x}", "user": {"login": login}}]
+                               for n, login in enumerate(("mona", "lisa", "otto", "rob", "sam"))})
+    assert feedback.learn(gh, BOT).rules == {"workflow/unpinned-action": [10, 11, 12, 13, 14]}
+
+
 # ── cost and failures ────────────────────────────────────────────────────
 
 

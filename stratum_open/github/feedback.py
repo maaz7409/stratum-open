@@ -114,6 +114,7 @@ def learn(gh: GitHub, bot: str, *, lookback: int = 100) -> Learned:
 
     - a 👎 on one of Stratum's inline comments, or an `/stratum ignore` reply
       to it, is a vote against that finding and its rule; a 👍 is one for;
+    - `/stratum ignore <fingerprint>` on a PR counts as that reply would;
     - `/stratum ignore <rule>` on a PR is a vote against the rule there.
 
     Only people with write access count, as for the App's votes and for the
@@ -122,7 +123,7 @@ def learn(gh: GitHub, bot: str, *, lookback: int = 100) -> Learned:
     by its fingerprint once maintainers voted against it more than for it.
     GitHub refusing a read (a rate limit, a token without access) hides less,
     or nothing, and `problem` says so."""
-    from stratum_open.github.commands import parse  # commands imports the runner, which imports this
+    from stratum_open.github.commands import FINGERPRINT, parse  # commands imports the runner, which imports this
 
     learned = Learned()
     try:
@@ -157,24 +158,32 @@ def learn(gh: GitHub, bot: str, *, lookback: int = 100) -> Learned:
         if root in about and command and command[0] == "ignore" and login and maintainer(login):
             votes[(root, login.lower())] = -1
 
+    try:
+        commands = gh.recent_issue_comments(lookback)
+    except (GitHubError, requests.RequestException) as exc:
+        commands = []
+        learned.problem = f"Couldn't read the repo's earlier PR comments ({_why(exc)}), so `/stratum ignore <rule>` there wasn't counted."
+    # A fingerprint names one of Stratum's inline comments on that PR, as a reply would.
+    by_fingerprint = {(number, fp): comment_id for comment_id, (fp, _, number) in about.items()}
+    ignored: set[tuple[int | None, str, str]] = set()  # (PR, person, rule)
+    for comment in commands:
+        login = (comment.get("user") or {}).get("login") or ""
+        command = parse(comment.get("body") or "")
+        if command and command[0] == "ignore" and command[1] and login and not publish._is_bot(comment, bot) and maintainer(login):
+            number = _number(comment.get("issue_url"))
+            if FINGERPRINT.fullmatch(command[1].lower()):
+                root = by_fingerprint.get((number, command[1].lower()))
+                if root is not None:
+                    votes[(root, login.lower())] = -1
+                continue  # not a rule, even when its comment is too old to be read
+            ignored.add((number, login.lower(), command[1]))
+
     rules, findings = _Tally(), _Tally()
     for (comment_id, _), vote in votes.items():
         fp, rule, number = about[comment_id]
         rules.add(rule, vote, number)
         if rule.startswith("model:"):  # a check's finding goes by its rule alone
             findings.add(fp, vote, number)
-
-    try:
-        commands = gh.recent_issue_comments(lookback)
-    except (GitHubError, requests.RequestException) as exc:
-        commands = []
-        learned.problem = f"Couldn't read the repo's earlier PR comments ({_why(exc)}), so `/stratum ignore <rule>` there wasn't counted."
-    ignored: set[tuple[int | None, str, str]] = set()  # (PR, person, rule)
-    for comment in commands:
-        login = (comment.get("user") or {}).get("login") or ""
-        command = parse(comment.get("body") or "")
-        if command and command[0] == "ignore" and command[1] and login and not publish._is_bot(comment, bot) and maintainer(login):
-            ignored.add((_number(comment.get("issue_url")), login.lower(), command[1]))
     for number, _, rule in ignored:
         rules.add(rule, -1, number)
 
