@@ -11,6 +11,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
+  # A reply in an inline thread. On a PR from a fork, GitHub gives this run a
+  # read-only token, so a reply there can't run a command: each inline comment
+  # then names the comment to post on the PR instead (`/stratum ignore <fingerprint>`).
   pull_request_review_comment:
     types: [created]
   # Optional: re-sort a PR when your CI finishes, so its label sees the result.

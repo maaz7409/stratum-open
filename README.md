@@ -91,15 +91,19 @@ Comment on a PR, with the command at the start of a line. One inside a code bloc
 | `/stratum review` | write access | Review the whole PR again |
 | `/stratum ignore` | write access | As a reply to an inline comment: hide that finding on this PR |
 | `/stratum ignore <rule>` | write access | Hide a rule on this PR |
+| `/stratum ignore <fingerprint>` | write access | Hide the finding with that fingerprint on this PR, as the reply does |
 | `/stratum mute <rule>` / `unmute` | write access | Hide a rule on every PR (GitHub App only, since it stores it) |
 | `/stratum explain` | the PR's author or write access, a few a day | As a reply to an inline comment: explain that finding in more detail |
+| `/stratum explain <fingerprint>` | the same people, sharing the same limit | Explain the finding with that fingerprint, as a comment on the PR |
 | `/stratum ask <question>` | the same people as `explain`, sharing its daily limit | Answer a question about the PR from its diff and review; as a reply to an inline comment, about that comment and its code |
 | `/stratum triage` | anyone | Why the PR got its label |
 | `/stratum record` | anyone | Your own track record in this repo |
 
+**On a PR from a fork, with the Action, reply commands don't run.** GitHub runs a reply in an inline thread with a read-only token on a PR from a fork, and the workflow's `permissions:` can't change that. So there, each inline comment names its finding's fingerprint, and you comment `/stratum ignore <fingerprint>` or `/stratum explain <fingerprint>` on the PR instead: a comment on the PR runs with the workflow's token. A reply there fails the job with a line saying what to post instead. The GitHub App reads replies on every PR.
+
 Commands used to be written `@stratum review`. They aren't read any more: `stratum` is an unrelated GitHub organization, and GitHub turned each one into a mention of it.
 
-**Rejected comments stay rejected.** With `review.learn_from_history: true`, each review first reads the repo's latest 100 inline comments and 100 PR comments from GitHub (`review.learn_lookback` sets how many), and leaves out findings like ones people with write access rejected there. A 👎 on one of Stratum's inline comments, a `/stratum ignore` reply to it, or `/stratum ignore <rule>` on a PR counts against it; a 👍 counts for it.
+**Rejected comments stay rejected.** With `review.learn_from_history: true`, each review first reads the repo's latest 100 inline comments and 100 PR comments from GitHub (`review.learn_lookback` sets how many), and leaves out findings like ones people with write access rejected there. A 👎 on one of Stratum's inline comments, a `/stratum ignore` reply to it (or `/stratum ignore <fingerprint>` on its PR), or `/stratum ignore <rule>` on a PR counts against it; a 👍 counts for it.
 - A rule is muted once it has 5 or more such votes and at least 60% of them are against it, as in the GitHub App. That goes for every finding of the rule, the checks' included, whatever its severity.
 - A model finding is also left out when maintainers voted against that same finding (same kind of problem, same file, same code) more than for it, on this PR or another.
 - The summary says what was left out and where it was rejected (for example "Hidden: 2 comments like ones maintainers rejected on #123 and #130"), and the comment threads of findings left out are closed with that reason.

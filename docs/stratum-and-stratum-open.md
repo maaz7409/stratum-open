@@ -49,6 +49,7 @@ both products get it.
 | `/stratum review` (also `re-review`) | Review the whole PR again (write access) | Same, as `@stratum review` |
 | `/stratum ignore` (as a reply) | Hide that finding on this PR (write access) | Same, as `@stratum ignore` |
 | `/stratum ignore <rule>` | Hide a rule on this PR (write access) | Same, as `@stratum ignore <rule>` |
+| `/stratum ignore <fingerprint>`, `/stratum explain <fingerprint>` | What the replies do, for one finding, as a comment on the PR; the form for a PR from a fork with the Action, where a reply can't run | Not available |
 | `/stratum mute <rule>` / `unmute` | Hide a rule on every PR; GitHub App only, since it stores it | Same, as `@stratum mute <rule>`; works on every install |
 | `/stratum explain` | The PR's author or write access, a few a day | `@stratum explain`: write access; it uses the team's AI provider or allowance |
 | `/stratum ask <question>` | The same people as `explain`, sharing its daily limit | Not available |
