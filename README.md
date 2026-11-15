@@ -1,7 +1,17 @@
-# Stratum Open
+<h1 align="center">Stratum Open</h1>
 
-PR review and triage for open-source maintainers, on GitHub's free runner.
-No API key, no account, and nothing is sent to Stratum.
+<p align="center">
+  PR review and triage for open-source maintainers, on GitHub's free runner.<br>
+  No API key, no account, and nothing is sent to Stratum.
+</p>
+
+<p align="center">
+  <a href="https://github.com/stratum-org/stratum-open/actions/workflows/tests.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/stratum-org/stratum-open/tests.yml?branch=main&label=ci"></a>
+  <a href="https://pypi.org/project/stratum-open/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/stratum-open?label=pypi"></a>
+  <img alt="Status: early" src="https://img.shields.io/badge/status-early-orange">
+  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
+</p>
 
 ![Two inline comments from Stratum Open's checks on a pull request: couponkit-pro isn't on PyPI, and line 6 has what looks like an API key](docs/images/review.png)
 
@@ -143,7 +153,7 @@ Gitea and Forgejo aren't supported yet; [docs/gitea-forgejo.md](docs/gitea-forge
   - Events: pull request, issue comment, pull request review comment.
 - **Run it:** `docker build -t stratum-open .` and run it with `STRATUM_APP_ID`, `STRATUM_APP_PRIVATE_KEY_FILE`, `STRATUM_WEBHOOK_SECRET` and `STRATUM_MODEL_ENDPOINT` set (see the [Dockerfile](Dockerfile)). Point the App's webhook at `https://your-host/webhook`.
 
-**CLI.** `pip install git+https://github.com/stratum-org/stratum-open` for:
+**CLI.** `pip install stratum-open` for:
 - `stratum-open review --local main`: review your branch against `main` before you open a PR. Handy for contributors too.
 - `stratum-open review owner/repo#123`: a dry run on any PR; `--post` publishes it.
 - `stratum-open record <login>`: a record from a local clone's history.
