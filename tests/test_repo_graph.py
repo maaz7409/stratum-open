@@ -1,3 +1,5 @@
+import time
+
 from stratum_open.repo.graph import Import, Importers, importers, parse_imports, reach_note
 
 
@@ -147,6 +149,43 @@ def test_an_import_continued_with_a_backslash_keeps_every_name():
     assert parse_imports("x.py", "import server.api, \\\n    server.db\nimport os\n") == [
         Import(1, "server.api"), Import(1, "server.db"), Import(3, "os")]
     assert parse_imports("x.py", "from server import api, \\\r\n    db\r\n") == [Import(1, "server", ("api", "db"))]
+
+
+def test_parenthesized_import_keeps_names_after_a_comment_with_a_paren():
+    for text in (
+        "from server import (api,  # see docs\n    db)\n",
+        "from server import (api,  # see docs()\n    db)\n",
+    ):
+        assert parse_imports("x.py", text) == [Import(1, "server", ("api", "db"))]
+
+
+def test_hash_inside_a_string_does_not_blank_the_rest_of_the_line():
+    # A `#` inside a one-line docstring must not blank the closing quotes or
+    # the imports that follow on later lines.
+    text = '"""Helpers for issue #12."""\nimport os\nfrom app import db\n'
+    assert parse_imports("x.py", text) == [Import(2, "os"), Import(3, "app", ("db",))]
+    # Both quote styles and escaped quotes inside strings.
+    text = "x = 'a # b'\ny = \"say \\\"hi # there\\\"\"\nimport os\n"
+    assert parse_imports("x.py", text) == [Import(3, "os")]
+
+
+def test_parenthesized_import_with_many_comments_returns_quickly():
+    text = "from app.models import (\n" + "".join(
+        f"    Name{i},  # used by the admin view\n" for i in range(5)
+    ) + ")\n"
+    started = time.monotonic()
+    assert parse_imports("x.py", text) == [
+        Import(1, "app.models", tuple(f"Name{i}" for i in range(5)))
+    ]
+    assert time.monotonic() - started < 1.0  # the old regex took ~0.2s for n=4, ~a day for n=8
+    # an unclosed `(` returns the module and no names, quickly
+    started = time.monotonic()
+    assert parse_imports("x.py", text[:-2]) == [Import(1, "app.models", ())]
+    assert time.monotonic() - started < 1.0
+    # a `)` inside a comment must not be taken for the end of the import
+    assert parse_imports("x.py", "from server import (api,  # see docs()\n    db,\n)") == [
+        Import(1, "server", ("api", "db"))
+    ]
 
 
 def test_reach_note_names_files_with_three_or_more_importers():
