@@ -198,6 +198,50 @@ def test_a_call_in_a_trailing_comment_is_not_flagged(path, line, expected):
     assert set(rules(run(diff(path, [line])))) & {"code/eval", "code/shell"} == expected
 
 
+DOCSTRING = [
+    "def run(command):",
+    '    """Run a command for the user.',
+    "",
+    "    Never pass shell=True here, and never eval(command) either.",
+    '    """',
+    "    return command.split()",
+]
+
+
+def test_a_call_named_in_a_multi_line_docstring_is_not_flagged():
+    """#158: a line inside a docstring opened above is prose, with only the
+    diff or with the whole file."""
+    path = "tools/run.py"
+    assert rules(run(diff(path, DOCSTRING, new=True))) == []
+    full = "\n".join(DOCSTRING) + "\n"
+    assert rules(run(diff(path, DOCSTRING, new=True), contents={path: full})) == []
+    # The docstring's first line is context: the diff still shows where it opens.
+    assert rules(run(diff(path, DOCSTRING[3:], context=DOCSTRING[:3]))) == []
+
+
+@pytest.mark.parametrize("lines", [
+    ['# """', "eval(x)"],  # quotes in a comment open nothing
+    ["q = '\"\"\"'", "eval(x)"],  # nor quotes inside another string
+    ['s = """a', 'b"""; eval(x)'],  # code after the string closes
+    ['s = """a"""', "eval(x)"],  # a string that closes on its own line
+    ["s = '''a", "b''' + eval(x)"],
+])
+def test_code_around_triple_quotes_is_still_checked(lines):
+    assert rules(run(diff("app.py", lines))) == ["code/eval"]
+
+
+def test_a_gap_in_the_diff_ends_a_docstring():
+    """What's between two hunks is unknown, so a string open at the end of
+    the first doesn't carry into the second."""
+    text = diff("app.py", ['"""Notes', "eval(a)"]) + "@@ -20,1 +22,2 @@\n x = 1\n+eval(b)\n"
+    assert [(f.rule, f.line_start) for f in run(text)] == [("code/eval", 23)]
+
+
+def test_a_secret_in_a_docstring_is_still_found():
+    token = "ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1gI3kM5"
+    assert rules(run(diff("app.py", ['"""Usage:', f"    login({token!r})", '"""']))) == ["code/secret"]
+
+
 @pytest.mark.parametrize("path,line", [
     ("db.py", 'cur.execute(f"SELECT * FROM users WHERE id = {user_id}")'),
     ("db.py", 'cur.execute("SELECT name FROM users WHERE id = %s" % user_id)'),

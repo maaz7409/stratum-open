@@ -3,8 +3,10 @@ commands, SQL put together from strings, and CORS opened to every origin.
 
 Each rule matches only shapes it's sure of, so a finding is worth reading but
 a quiet run proves little. Lines are judged one at a time: a call or a SQL
-string split over several lines is mostly missed. Test files are skipped for
-everything but token-shaped secrets, which leak just the same from a test.
+string split over several lines is mostly missed. The one thing carried from
+line to line is a Python triple-quoted string, so a docstring's prose isn't
+read as code. Test files are skipped for everything but token-shaped
+secrets, which leak just the same from a test.
 A file moved to where more of the rules apply (out of `tests/`, or to another
 language) is checked in full.
 """
@@ -58,13 +60,18 @@ def check(files: list[FileDiff], contents: dict[str, str] | None = None) -> list
         test = is_test_path(file.path)
         lines = dict(view(file, contents))
         child_process = ext in JAVASCRIPT and any("child_process" in line for line in lines.values())
+        # Inside a docstring the secret scan still reads every word, but the other rules see only
+        # the code after the string closes: a docstring that warns against `eval(` runs nothing.
+        starts = _code_starts(lines) if ext in PYTHON else {}
+        code_lines = {n: line[starts.get(n, 0):] for n, line in lines.items()} if starts else lines
         for number, text in added:
             findings.extend(_secrets(file.path, number, text, lines, test))
-            if is_comment(text) or len(text) > MAX_LINE:
+            text = code_lines.get(number, text)
+            if not text.strip() or is_comment(text) or len(text) > MAX_LINE:
                 continue
             if not test:
                 findings.extend(_eval(file.path, number, text, ext))
-                findings.extend(_shell(file.path, number, text, ext, lines, child_process))
+                findings.extend(_shell(file.path, number, text, ext, code_lines, child_process))
                 if ext in SQL_HOSTS:
                     findings.extend(_sql(file.path, number, text, ext))
             if ext not in DOCS and not test:
@@ -323,6 +330,54 @@ def _strings(text: str) -> tuple[tuple[int, int, str, str | None], ...]:
             found.append((i, n, quote, None))  # open to the end of the line
             break
     return tuple(found)
+
+
+_TRIPLE = re.compile(r"\"\"\"|'''")
+
+
+def _code_starts(lines: dict[int, str]) -> dict[int, int]:
+    """For each Python line that starts inside a triple-quoted string opened
+    on a line above, where its code starts: just past the closing quotes, or
+    the end of the line when the string runs on. Other lines start at 0 and
+    aren't listed. Only quotes that are code open a string, not ones in a
+    comment or inside another string. A gap in what the diff shows ends the
+    string, since what's in the gap is unknown."""
+    starts: dict[int, int] = {}
+    quote: str | None = None
+    previous: int | None = None
+    for number, text in lines.items():
+        if previous is not None and number != previous + 1:
+            quote = None
+        previous = number
+        pos = 0
+        if quote is not None:
+            close = _closing_quote(text, quote)
+            pos = starts[number] = len(text) if close is None else close
+            if close is None:
+                continue
+            quote = None
+        rest = text[pos:]
+        if not _TRIPLE.search(rest):
+            continue
+        strings = _strings(rest)
+        if strings:
+            start, _, last, body = strings[-1]
+            if body is None and len(last) == 3 and _is_code(rest, start, ".py"):
+                quote = last
+    return starts
+
+
+def _closing_quote(text: str, quote: str) -> int | None:
+    """Just past the first `quote` in `text` that isn't escaped, if any."""
+    i = 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+        elif text.startswith(quote, i):
+            return i + len(quote)
+        else:
+            i += 1
+    return None
 
 
 def _constant_command(lines: dict[int, str], number: int) -> bool:
