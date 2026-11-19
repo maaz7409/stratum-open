@@ -208,15 +208,35 @@ DOCSTRING = [
 ]
 
 
+def found_in(text, **kwargs):
+    """(rule, line) for every finding on a diff."""
+    return [(f.rule, f.line_start) for f in run(text, **kwargs)]
+
+
+def found(lines, path="app.py"):
+    """(rule, line) for every finding on a new file of `lines`."""
+    return found_in(diff(path, lines, new=True))
+
+
 def test_a_call_named_in_a_multi_line_docstring_is_not_flagged():
-    """#158: a line inside a docstring opened above is prose, with only the
-    diff or with the whole file."""
+    """#158: a line inside a docstring opened above is prose, whether the
+    whole file comes from a new file's diff or from its full text."""
     path = "tools/run.py"
-    assert rules(run(diff(path, DOCSTRING, new=True))) == []
-    full = "\n".join(DOCSTRING) + "\n"
-    assert rules(run(diff(path, DOCSTRING, new=True), contents={path: full})) == []
-    # The docstring's first line is context: the diff still shows where it opens.
-    assert rules(run(diff(path, DOCSTRING[3:], context=DOCSTRING[:3]))) == []
+    assert found(DOCSTRING, path) == []
+    modified = diff(path, DOCSTRING[3:], context=DOCSTRING[:3])
+    assert rules(run(modified, contents={path: "\n".join(DOCSTRING) + "\n"})) == []
+
+
+def test_part_of_a_file_is_read_as_code_throughout():
+    """Without the whole file there's no telling whether a hunk starts inside
+    a string, and a wrong guess hides real calls: here the first line shown
+    closes a docstring, and the eval after it runs."""
+    text = diff("app.py", ["    eval(request.args['code'])"], start=4, context=[
+        "    Long description line one.", "    Long description line two.", '    """',
+    ])
+    assert found_in(text) == [("code/eval", 7)]
+    # Nor does the docstring's prose get a pass when the diff shows where it opens.
+    assert rules(run(diff("tools/run.py", DOCSTRING[3:], context=DOCSTRING[:3]))) == ["code/eval", "code/shell"]
 
 
 @pytest.mark.parametrize("lines", [
@@ -225,21 +245,37 @@ def test_a_call_named_in_a_multi_line_docstring_is_not_flagged():
     ['s = """a', 'b"""; eval(x)'],  # code after the string closes
     ['s = """a"""', "eval(x)"],  # a string that closes on its own line
     ["s = '''a", "b''' + eval(x)"],
+    # A backslash continues a one-quote string, so the """ is inside it and opens nothing.
+    ["BANNER = 'deploy tool \\", "\"\"\"'", "eval(x)"],
+    # A nested f-string (3.12): a syntax error on 3.11, where nothing is skipped.
+    ['x = f"{"""a"""}"', "eval(x)"],
 ])
 def test_code_around_triple_quotes_is_still_checked(lines):
-    assert rules(run(diff("app.py", lines))) == ["code/eval"]
+    assert found(lines) == [("code/eval", len(lines))]
 
 
-def test_a_gap_in_the_diff_ends_a_docstring():
-    """What's between two hunks is unknown, so a string open at the end of
-    the first doesn't carry into the second."""
-    text = diff("app.py", ['"""Notes', "eval(a)"]) + "@@ -20,1 +22,2 @@\n x = 1\n+eval(b)\n"
-    assert [(f.rule, f.line_start) for f in run(text)] == [("code/eval", 23)]
+def test_a_string_reopened_where_one_closes_is_followed():
+    assert found(['s = """a', 'b""" + """c', "never eval(x) here", '"""', "eval(y)"]) == [("code/eval", 5)]
+
+
+def test_an_escaped_quote_does_not_close_a_docstring():
+    assert found(['s = """a \\"""', "never eval(x) here", '"""']) == []
+
+
+def test_prose_in_a_string_is_not_read_as_the_call_a_shell_flag_belongs_to():
+    """`shell=True` is judged by the call above it. A `run("ls")` in a
+    string between them isn't that call: the real one runs `cmd`."""
+    lines = ["subprocess.run(", "    cmd,", '    input="""', '    then run("ls")', '    """,', "    shell=True,", ")"]
+    assert found(lines) == [("code/shell", 6)]
+
+
+def test_a_file_that_does_not_parse_is_read_as_code_throughout():
+    assert found(["def run(:", '    """Run it.', "    Never eval(x) here.", '    """']) == [("code/eval", 3)]
 
 
 def test_a_secret_in_a_docstring_is_still_found():
     token = "ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1gI3kM5"
-    assert rules(run(diff("app.py", ['"""Usage:', f"    login({token!r})", '"""']))) == ["code/secret"]
+    assert found(['"""Usage:', f"    login({token!r})", '"""']) == [("code/secret", 2)]
 
 
 @pytest.mark.parametrize("path,line", [

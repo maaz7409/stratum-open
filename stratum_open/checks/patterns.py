@@ -3,18 +3,20 @@ commands, SQL put together from strings, and CORS opened to every origin.
 
 Each rule matches only shapes it's sure of, so a finding is worth reading but
 a quiet run proves little. Lines are judged one at a time: a call or a SQL
-string split over several lines is mostly missed. The one thing carried from
-line to line is a Python triple-quoted string, so a docstring's prose isn't
-read as code. Test files are skipped for everything but token-shaped
-secrets, which leak just the same from a test.
+string split over several lines is mostly missed. When the whole of a
+Python file is at hand, its parser marks the lines inside multi-line strings,
+so a docstring's prose isn't read as code. Test files are skipped for
+everything but token-shaped secrets, which leak just the same from a test.
 A file moved to where more of the rules apply (out of `tests/`, or to another
 language) is checked in full.
 """
 
 from __future__ import annotations
 
+import ast
 import functools
 import re
+import warnings
 
 from stratum_open.checks.common import basename, checked_lines, extension, is_comment, is_test_path, view
 from stratum_open.diff import FileDiff
@@ -62,7 +64,8 @@ def check(files: list[FileDiff], contents: dict[str, str] | None = None) -> list
         child_process = ext in JAVASCRIPT and any("child_process" in line for line in lines.values())
         # Inside a docstring the secret scan still reads every word, but the other rules see only
         # the code after the string closes: a docstring that warns against `eval(` runs nothing.
-        starts = _code_starts(lines) if ext in PYTHON else {}
+        whole = (contents or {}).get(file.path) is not None or file.status == "added"
+        starts = _code_starts(lines, whole) if ext in PYTHON else {}
         code_lines = {n: line[starts.get(n, 0):] for n, line in lines.items()} if starts else lines
         for number, text in added:
             findings.extend(_secrets(file.path, number, text, lines, test))
@@ -332,52 +335,50 @@ def _strings(text: str) -> tuple[tuple[int, int, str, str | None], ...]:
     return tuple(found)
 
 
-_TRIPLE = re.compile(r"\"\"\"|'''")
+# A Python file bigger than this isn't parsed to find its multi-line strings: it was generated,
+# and parsing it would cost more than the check.
+MAX_PARSE = 1_000_000
 
 
-def _code_starts(lines: dict[int, str]) -> dict[int, int]:
-    """For each Python line that starts inside a triple-quoted string opened
-    on a line above, where its code starts: just past the closing quotes, or
-    the end of the line when the string runs on. Other lines start at 0 and
-    aren't listed. Only quotes that are code open a string, not ones in a
-    comment or inside another string. A gap in what the diff shows ends the
-    string, since what's in the gap is unknown."""
+def _code_starts(lines: dict[int, str], whole: bool) -> dict[int, int]:
+    """For each line of a Python file that starts inside a string opened on a
+    line above (most often a docstring), where its code starts: just past the
+    string's end, or the end of the line when the string runs on. Other lines
+    start at 0 and aren't listed.
+
+    Python's own parser finds the strings, so this needs the whole file
+    (`whole`: its full text, or a new file's diff, which shows every line).
+    With less, or when the file doesn't parse (a syntax error, or syntax newer
+    than the Python running the review), nothing is listed and every line is
+    read as code. A guess from part of the file, or a reading of the quotes
+    that differs from Python's, would hide real calls whenever it was wrong."""
+    if not whole or list(lines) != list(range(1, len(lines) + 1)):
+        return {}
+    text = "\n".join(lines.values())
+    if len(text) > MAX_PARSE or "\r" in text:  # a lone CR is a line break to Python, not to `view`
+        return {}
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # an invalid escape like "\d" is a SyntaxWarning
+            tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return {}
     starts: dict[int, int] = {}
-    quote: str | None = None
-    previous: int | None = None
-    for number, text in lines.items():
-        if previous is not None and number != previous + 1:
-            quote = None
-        previous = number
-        pos = 0
-        if quote is not None:
-            close = _closing_quote(text, quote)
-            pos = starts[number] = len(text) if close is None else close
-            if close is None:
-                continue
-            quote = None
-        rest = text[pos:]
-        if not _TRIPLE.search(rest):
-            continue
-        strings = _strings(rest)
-        if strings:
-            start, _, last, body = strings[-1]
-            if body is None and len(last) == 3 and _is_code(rest, start, ".py"):
-                quote = last
+    nodes: list[ast.AST] = [tree]
+    while nodes:
+        node = nodes.pop()
+        if isinstance(node, ast.JoinedStr):
+            continue  # an f-string's {...} is code, and 3.11 gives the parts inside the wrong places
+        if (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+                and node.end_lineno is not None and node.end_col_offset is not None
+                and node.end_lineno > node.lineno):
+            for number in range(node.lineno + 1, node.end_lineno):
+                starts[number] = len(lines[number])
+            end = lines[node.end_lineno]
+            # The parser counts columns in UTF-8 bytes.
+            starts[node.end_lineno] = len(end.encode()[:node.end_col_offset].decode(errors="ignore"))
+        nodes.extend(ast.iter_child_nodes(node))
     return starts
-
-
-def _closing_quote(text: str, quote: str) -> int | None:
-    """Just past the first `quote` in `text` that isn't escaped, if any."""
-    i = 0
-    while i < len(text):
-        if text[i] == "\\":
-            i += 2
-        elif text.startswith(quote, i):
-            return i + len(quote)
-        else:
-            i += 1
-    return None
 
 
 def _constant_command(lines: dict[int, str], number: int) -> bool:
