@@ -88,6 +88,27 @@ def test_one_vote_per_voter_the_latest_wins_and_zero_removes(storage):
         storage.record_vote(REPO, "check:eval", "fp1", 101, "alice", 2)
 
 
+def test_replacing_a_comments_votes_drops_the_ones_taken_back(storage):
+    storage.replace_votes(REPO, "check:eval", "fp1", 101, {"Alice": -1, "bob": -1, "carol": 1})
+    storage.replace_votes(REPO, "check:eval", "fp2", 102, {"alice": -1})  # another comment: left alone
+    assert storage.rule_votes(REPO) == {"check:eval": (1, 3)}
+    cast = {row["voter"]: row["voted_at"] for row in storage.export(REPO)["votes"]}
+
+    # bob took his back, carol changed hers, and GitHub wouldn't say whether dave still has write access.
+    storage.record_vote(REPO, "check:eval", "fp1", 101, "dave", -1)
+    storage.replace_votes(REPO, "check:eval", "fp1", 101, {"ALICE": -1, "carol": -1}, keep=["Dave"])
+    rows = {(row["comment_id"], row["voter"]): row for row in storage.export(REPO)["votes"]}
+    assert {key: row["vote"] for key, row in rows.items()} == {
+        (101, "alice"): -1, (101, "carol"): -1, (101, "dave"): -1, (102, "alice"): -1}
+    assert rows[(101, "alice")]["voted_at"] == cast["alice"]  # unchanged, so still when it was cast
+
+    storage.replace_votes(REPO, "check:eval", "fp1", 101, {})
+    assert storage.rule_votes(REPO) == {"check:eval": (0, 1)}
+    storage.replace_votes(OTHER, "check:eval", "fp1", 101, {})  # nothing to remove is fine
+    with pytest.raises(ValueError):
+        storage.replace_votes(REPO, "check:eval", "fp1", 101, {"alice": 0})
+
+
 def test_rules_are_muted_by_enough_thumbs_down(storage):
     def vote(comment_id, rule, up, down):
         for n in range(up + down):
@@ -275,7 +296,7 @@ def _protocol_methods():
 @pytest.mark.parametrize("cls", [NullStorage, SQLiteStorage])
 def test_storages_match_the_protocol(cls):
     names = _protocol_methods()
-    assert len(names) == 13
+    assert len(names) == 14
     for name in names:
         assert inspect.signature(getattr(cls, name)) == inspect.signature(getattr(Storage, name)), name
 
@@ -285,6 +306,7 @@ def test_null_storage_stores_nothing():
     null.record_review(REPO, 1, "abc", 5, "", [finding()])
     null.record_job(REPO, 1, "push", "reviewed", prompt_log="p")
     null.record_vote(REPO, "rule", "fp", 1, "alice", -1)
+    null.replace_votes(REPO, "rule", "fp", 1, {"alice": -1}, keep=["bob"])
     null.mute(REPO, "rule", by="maintainer")
     null.unmute(REPO, "rule")
     assert null.rule_votes(REPO) == {}

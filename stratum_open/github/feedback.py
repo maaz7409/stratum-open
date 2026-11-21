@@ -37,6 +37,7 @@ class _Access:
     def __init__(self, gh: GitHub, limit: int | None = None):
         self.gh, self.limit = gh, limit
         self.known: dict[str, bool] = {}
+        self.unsure: set[str] = set()  # those GitHub wouldn't say about
 
     def __call__(self, login: str) -> bool:
         key = login.lower()
@@ -47,21 +48,28 @@ class _Access:
                 self.known[key] = self.gh.permission(login) in WRITE
             except (GitHubError, requests.RequestException):
                 self.known[key] = False
+                self.unsure.add(key)
         return self.known[key]
 
 
 def collect_votes(gh: GitHub, number: int, bot: str, storage: Storage) -> int:
-    """Record every write-access 👍/👎 on this PR's Stratum comments. Returns
-    how many votes were recorded."""
+    """Store the write-access 👍/👎 on this PR's Stratum comments as they are
+    now, so a vote taken back stops counting. A stored vote is kept when
+    GitHub won't say whether its voter has write access. Returns how many
+    votes were recorded."""
     maintainer = _Access(gh)
     recorded = 0
     for comment, fp, rule in _marked(gh.review_comments(number), bot):
-        totals = comment.get("reactions") or {}
-        if not (totals.get("+1") or totals.get("-1")):
-            continue
-        for voter, vote in _votes(gh, comment["id"], maintainer):
-            storage.record_vote(gh.repo, rule, fp, comment["id"], voter, vote)
-            recorded += 1
+        totals = comment.get("reactions")
+        votes: dict[str, int] = {}
+        reactors: set[str] = set()
+        # The totals come with the comment, so one with no 👍 or 👎 costs no call.
+        if totals is None or totals.get("+1") or totals.get("-1"):
+            reactions = gh.reactions(comment["id"])
+            votes = dict(_votes(reactions, maintainer))
+            reactors = {(r.get("user") or {}).get("login", "").lower() for r in reactions if r.get("content") in VOTES}
+        storage.replace_votes(gh.repo, rule, fp, comment["id"], votes, keep=maintainer.unsure & reactors)
+        recorded += len(votes)
     return recorded
 
 
@@ -75,9 +83,9 @@ def _marked(comments: list[dict], bot: str) -> list[tuple[dict, str, str]]:
     return found
 
 
-def _votes(gh: GitHub, comment_id: int, maintainer: Callable[[str], bool]) -> Iterator[tuple[str, int]]:
-    """(voter, vote) for each 👍/👎 on a comment by someone with write access."""
-    for reaction in gh.reactions(comment_id):
+def _votes(reactions: list[dict], maintainer: Callable[[str], bool]) -> Iterator[tuple[str, int]]:
+    """(voter, vote) for each 👍/👎 among a comment's reactions by someone with write access."""
+    for reaction in reactions:
         vote = VOTES.get(reaction.get("content"))
         voter = (reaction.get("user") or {}).get("login", "")
         if vote is not None and voter and maintainer(voter):
@@ -148,7 +156,7 @@ def learn(gh: GitHub, bot: str, *, lookback: int = 100) -> Learned:
     failed = 0
     for comment, _, _ in (down + up)[:MAX_REACTION_READS]:
         try:
-            for voter, vote in _votes(gh, comment["id"], maintainer):
+            for voter, vote in _votes(gh.reactions(comment["id"]), maintainer):
                 votes[(comment["id"], voter.lower())] = vote
         except (GitHubError, requests.RequestException):
             failed += 1
