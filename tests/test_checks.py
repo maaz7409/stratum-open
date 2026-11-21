@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -274,17 +275,34 @@ def test_a_lone_carriage_return_skips_the_parse():
     assert found_in(diff("app.py", lines, new=True), contents={"app.py": text}) == [("code/eval", 4)]
 
 
-@pytest.mark.parametrize("coding,expected", [
+@pytest.mark.parametrize("coding,flagged", [
     # In UTF-7, +ACIAIgAi- is three double quotes: Python ends the string there and runs the eval.
-    ("# -*- coding: utf-7 -*-", [("code/eval", 4)]),
-    ("# vim: set fileencoding=latin-1 :", [("code/eval", 4)]),
-    ("# coding: no-such-codec", [("code/eval", 4)]),
+    ("# -*- coding: utf-7 -*-", True),
+    ("# vim: set fileencoding=latin-1 :", True),
+    ("# coding: no-such-codec", True),
+    ("# coding: " + "x" * 100, True),  # too long to be a codec: not looked up
+    # Python reads an encoding line on line 2 too: after a shebang, or after a first line it
+    # ignores, since its match is case-sensitive.
+    ("#!/usr/bin/env python\n# -*- coding: utf-7 -*-", True),
+    ("# CODING: utf-8\n# -*- coding: utf-7 -*-", True),
     # UTF-8 is what the parse reads, so the string is skipped as usual.
-    ("# -*- coding: utf-8 -*-", []),
-    ("# coding=UTF8", []),
+    ("# -*- coding: utf-8 -*-", False),
+    ("# coding=UTF8", False),
+    ("#!/usr/bin/env python\n# -*- coding: utf-8 -*-", False),
 ])
-def test_a_file_in_another_encoding_is_read_as_code_throughout(coding, expected):
-    assert found([coding, 'x = """', "+ACIAIgAi-", "eval(code)", '"""', "z = 1 #+ACIAIgAi-"]) == expected
+def test_a_file_in_another_encoding_is_read_as_code_throughout(coding, flagged):
+    head = coding.split("\n")
+    lines = [*head, 'x = """', "+ACIAIgAi-", "eval(code)", '"""', "z = 1 #+ACIAIgAi-"]
+    assert found(lines) == ([("code/eval", len(head) + 3)] if flagged else [])
+
+
+def test_a_name_too_long_to_be_a_codec_is_not_looked_up(monkeypatch):
+    """The codec registry keeps every name it fails to find, for the life of
+    the process: in the App, a stream of long names would add up."""
+    looked_up = []
+    monkeypatch.setattr(patterns, "codecs", SimpleNamespace(lookup=lambda name: looked_up.append(name)))
+    assert found(["# coding: " + "x" * 100, 'x = """', "eval(code)", '"""']) == [("code/eval", 3)]
+    assert looked_up == []
 
 
 def test_a_line_the_file_text_disagrees_on_is_judged_as_the_diff_shows_it():

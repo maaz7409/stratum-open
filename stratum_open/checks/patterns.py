@@ -391,12 +391,19 @@ def _utf8(lines: dict[int, str]) -> bool:
     """Whether Python reads the file as UTF-8, as the parse here does. Under
     another encoding line the same bytes can be other code: in UTF-7,
     `+ACIAIgAi-` is three double quotes, so a string the parse sees can end
-    early and what follows it runs."""
+    early and what follows it runs.
+
+    Every encoding line found must name UTF-8, not just the first: matched in
+    any case, a first line Python ignores (`# CODING: utf-8`) would otherwise
+    hide the one on line 2 that it reads. A name too long to be a codec isn't
+    looked up, since the codec registry keeps every name it fails to find."""
     for number in (1, 2):
         match = _ENCODING.match(lines.get(number, ""))
         if match:
+            name = match.group(1)
             try:
-                return codecs.lookup(match.group(1)).name == "utf-8"
+                if len(name) > 40 or codecs.lookup(name).name != "utf-8":
+                    return False
             except LookupError:
                 return False
     return True
