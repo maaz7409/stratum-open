@@ -310,8 +310,8 @@ class Server:
                 return
             try:
                 collect_votes(ctx.gh, number, ctx.bot, self.storage)
-            except GitHubError as exc:
-                self.log(f"{repo}#{number}: couldn't read reactions: {exc}")
+            except (GitHubError, requests.RequestException) as exc:  # votes wait for the next push; the review goes on
+                self.log(redact(f"{repo}#{number}: couldn't read reactions: {type(exc).__name__}: {exc}"))
             outcome = review_pull(ctx, number)
             self.storage.record_job(repo, number, "review", outcome.status, outcome.note)
             self._queue_after(ctx, payload)

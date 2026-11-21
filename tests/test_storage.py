@@ -1,4 +1,5 @@
 import inspect
+import itertools
 import json
 import sqlite3
 import threading
@@ -88,25 +89,32 @@ def test_one_vote_per_voter_the_latest_wins_and_zero_removes(storage):
         storage.record_vote(REPO, "check:eval", "fp1", 101, "alice", 2)
 
 
-def test_replacing_a_comments_votes_drops_the_ones_taken_back(storage):
+def test_replacing_a_comments_votes_drops_the_ones_taken_back(storage, monkeypatch):
+    ticks = itertools.count()
+    monkeypatch.setattr("stratum_open.storage._stamp", lambda *_: f"2026-11-21T00:00:{next(ticks):02d}Z")  # a clock that moves
     storage.replace_votes(REPO, "check:eval", "fp1", 101, {"Alice": -1, "bob": -1, "carol": 1})
     storage.replace_votes(REPO, "check:eval", "fp2", 102, {"alice": -1})  # another comment: left alone
     assert storage.rule_votes(REPO) == {"check:eval": (1, 3)}
-    cast = {row["voter"]: row["voted_at"] for row in storage.export(REPO)["votes"]}
+    cast = {(row["comment_id"], row["voter"]): row["voted_at"] for row in storage.export(REPO)["votes"]}
 
-    # bob took his back, carol changed hers, and GitHub wouldn't say whether dave still has write access.
+    # bob took his back and carol changed hers. GitHub wouldn't say whether dave, erin and frank have
+    # write access: dave's stored vote follows his reaction, and none is added for erin; frank no longer reacts.
     storage.record_vote(REPO, "check:eval", "fp1", 101, "dave", -1)
-    storage.replace_votes(REPO, "check:eval", "fp1", 101, {"ALICE": -1, "carol": -1}, keep=["Dave"])
+    storage.record_vote(REPO, "check:eval", "fp1", 101, "frank", -1)
+    storage.replace_votes(REPO, "check:eval", "fp1", 101, {"ALICE": -1, "carol": -1}, unsure={"Dave": 1, "erin": -1})
     rows = {(row["comment_id"], row["voter"]): row for row in storage.export(REPO)["votes"]}
     assert {key: row["vote"] for key, row in rows.items()} == {
-        (101, "alice"): -1, (101, "carol"): -1, (101, "dave"): -1, (102, "alice"): -1}
-    assert rows[(101, "alice")]["voted_at"] == cast["alice"]  # unchanged, so still when it was cast
+        (101, "alice"): -1, (101, "carol"): -1, (101, "dave"): 1, (102, "alice"): -1}
+    assert rows[(101, "alice")]["voted_at"] == cast[(101, "alice")]  # unchanged, so still when it was cast
+    assert rows[(101, "carol")]["voted_at"] > cast[(101, "carol")]
 
     storage.replace_votes(REPO, "check:eval", "fp1", 101, {})
     assert storage.rule_votes(REPO) == {"check:eval": (0, 1)}
     storage.replace_votes(OTHER, "check:eval", "fp1", 101, {})  # nothing to remove is fine
     with pytest.raises(ValueError):
         storage.replace_votes(REPO, "check:eval", "fp1", 101, {"alice": 0})
+    with pytest.raises(ValueError):
+        storage.replace_votes(REPO, "check:eval", "fp1", 101, {}, unsure={"alice": 2})
 
 
 def test_rules_are_muted_by_enough_thumbs_down(storage):
@@ -306,7 +314,7 @@ def test_null_storage_stores_nothing():
     null.record_review(REPO, 1, "abc", 5, "", [finding()])
     null.record_job(REPO, 1, "push", "reviewed", prompt_log="p")
     null.record_vote(REPO, "rule", "fp", 1, "alice", -1)
-    null.replace_votes(REPO, "rule", "fp", 1, {"alice": -1}, keep=["bob"])
+    null.replace_votes(REPO, "rule", "fp", 1, {"alice": -1}, unsure={"bob": 1})
     null.mute(REPO, "rule", by="maintainer")
     null.unmute(REPO, "rule")
     assert null.rule_votes(REPO) == {}
