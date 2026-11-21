@@ -38,6 +38,9 @@ permissions:
   # Reads the workflow runs, to tell CI waiting for a maintainer's approval (a
   # first-time contributor's PR) from CI that passed. Needed on a private repo.
   actions: read
+  # For the code scanning upload at the end of the stratum job: uncomment it with that step.
+  # It also lets the job's token change and dismiss code scanning alerts.
+  # security-events: write
 
 jobs:
   stratum:
@@ -82,6 +85,34 @@ jobs:
           ollama-model: gpt-oss:20b
           # Uncomment together with the queue job below, never on its own (see there).
           # triage-queue: false
+          # Uncomment together with `security-events: write` above and the step below.
+          # sarif: stratum.sarif
+
+      # The findings in Security > Code scanning: "Findings in code scanning" in the README.
+      # Commented out until the release after 0.3.0: v0.3.0 has no `sarif` input, so it would
+      # write no file and the upload would never run. That release's commit uncomments this
+      # step, `sarif` and `security-events: write`, along with the pin bump.
+      # - name: Upload the findings to code scanning
+      #   if: github.event_name == 'pull_request_target' && hashFiles('stratum.sarif') != ''
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #     PR: ${{ github.event.pull_request.number }}
+      #     SHA: ${{ github.event.pull_request.head.sha }}
+      #   # For the PR's head, whose lines the findings are on: on pull_request_target, GITHUB_REF and
+      #   # GITHUB_SHA are the default branch's. Through the API, since github/codeql-action/upload-sarif
+      #   # takes the commit from `git rev-parse HEAD` in the workspace (the default branch here), and
+      #   # its `sha` input only when git fails there. Then it waits until code scanning has taken it.
+      #   run: |
+      #     gzip -c stratum.sarif | base64 -w0 > "$RUNNER_TEMP/stratum.sarif.b64"
+      #     id=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs" -f commit_sha="$SHA" -f ref="refs/pull/$PR/head" \
+      #       -f tool_name="Stratum Open" -F sarif=@"$RUNNER_TEMP/stratum.sarif.b64" --jq .id)
+      #     for _ in $(seq 60); do
+      #       status=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs/$id" --jq .processing_status)
+      #       [ "$status" = pending ] || break
+      #       sleep 5
+      #     done
+      #     echo "Code scanning: $status"
+      #     [ "$status" = complete ] || { gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs/$id"; exit 1; }
 
   # Rebuilds the triage queue issue after the stratum job: after each PR's
   # review, when a PR closes or turns back into a draft, after `/stratum review`

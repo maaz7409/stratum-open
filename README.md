@@ -96,6 +96,47 @@ A build that fails, a run past its time limit (5 minutes for go vet, 10 for Clip
 
 GitHub's Ubuntu runners come with Go, and with Rust and Clippy. If your `go.mod` or `rust-toolchain.toml` asks for a newer version, Go or rustup downloads it, which counts towards the time limit. `staticcheck` you install yourself (`go install honnef.co/go/tools/cmd/staticcheck@latest`); once it's on PATH, go vet adds its SA checks.
 
+### Findings in code scanning (SARIF)
+
+From the release after 0.3.0, the Action can also write a PR's findings as SARIF 2.1.0, which GitHub's code scanning reads, and so do many editors and other tools. Code scanning is free on public repositories; a private one needs GitHub Code Security. To turn it on, add `security-events: write` to the workflow's `permissions:`, set the `sarif` input, and upload the file after Stratum's step. Code scanning then adds its own inline comment on the PR for each new alert (from `github-advanced-security[bot]`, and GitHub refuses to delete those, even for an admin), a check run, and, the first time, a comment saying code scanning has been set up, so each finding shows twice. `security-events: write` also lets the job's token change and dismiss the repository's code scanning alerts, in a job that runs for anyone's PR, though no code from the PR runs in it.
+
+```yaml
+      - uses: stratum-org/stratum-open@<the release after 0.3.0>
+        with:
+          ollama-model: gpt-oss:20b
+          sarif: stratum.sarif
+      - name: Upload the findings to code scanning
+        if: github.event_name == 'pull_request_target' && hashFiles('stratum.sarif') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gzip -c stratum.sarif | base64 -w0 > "$RUNNER_TEMP/stratum.sarif.b64"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs" -f commit_sha="$SHA" -f ref="refs/pull/$PR/head" \
+            -f tool_name="Stratum Open" -F sarif=@"$RUNNER_TEMP/stratum.sarif.b64" --jq .id)
+          for _ in $(seq 60); do
+            status=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs/$id" --jq .processing_status)
+            [ "$status" = pending ] || break
+            sleep 5
+          done
+          echo "Code scanning: $status"
+          [ "$status" = complete ] || { gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs/$id"; exit 1; }
+```
+
+[examples/stratum.yml](examples/stratum.yml) has these lines commented out until that release, since 0.3.0's action has no `sarif` input.
+
+- **The PR's head:** the step files the findings under the PR's ref (`refs/pull/<n>/head`) and head commit, whose lines they're on. On `pull_request_target`, a run's `GITHUB_REF` and `GITHUB_SHA` are the default branch's. It then waits until code scanning has processed the file, and fails the job if it couldn't.
+- **Why not `github/codeql-action/upload-sarif`:** it takes the commit from `git rev-parse HEAD` in its checkout, and uses its `sha` input only when git fails there (`uploadPostProcessedFiles` in its `upload-lib.ts`, and `getCommitOid` in `git-utils.ts`). In this workflow the checkout is the default branch, so it would file a PR's findings under the default branch's latest commit.
+- **PRs from forks:** on `pull_request_target`, the job has the base repository's token for a fork's PR too, so the upload is the same for it. A `pull_request` workflow couldn't upload there, since GitHub gives a fork's PR a read-only token.
+- **What code scanning does with it**, as seen on one upload to a PR: an alert for each result, on the PR's ref (the Security tab lists them under `pr:<n>`, not with the default branch's), the inline comments above, and a check run named "Stratum Open", which failed there with "2 new alerts including 2 errors".
+- **When:** the file is written when the review of a PR event (opened, pushed to, reopened, ready for review) is posted, and only if the review read the event's commit, which the upload step names. A run started again after a newer push reviews the newer commit, so it writes none, and that push's own run writes it. `/stratum review` and a CI re-sort don't write it.
+- **What's in it:** one result per finding on a line, with the check's rule id, or `model/<category>` for the model's findings, since their wording changes from run to run and code scanning tracks an alert by its rule. Critical and high findings are errors, medium ones warnings, low ones notes. `properties.source` says `check` or `model`, and the rules are tagged the same way, so you can leave the model's findings out. Each finding's fingerprint is its `primaryLocationLineHash`, which code scanning uses to match an alert across runs.
+- **Findings without a line** (about a whole file, or the PR): code scanning shows a result only on a line, so they're in the run's `properties.findingsWithoutLine` instead, in the same shape.
+- **Limits:** code scanning keeps the 5,000 most severe results of a run and takes files up to 10 MB, so the file holds no more, the most severe first. The job's log says how many were left out, and so does the run's `properties.leftOut`.
+
+With the CLI, `--sarif FILE` writes the same file for `stratum-open review --local main` and `stratum-open review owner/repo#123`, and a line on stderr says what's in it. It uploads nothing.
+
 ## What it does on each PR
 
 - **Checks that need no model** catch what's risky whoever wrote it:
