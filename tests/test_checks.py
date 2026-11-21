@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -196,6 +197,144 @@ def test_fixed_commands_and_argument_lists_are_not_flagged(path, lines):
 ])
 def test_a_call_in_a_trailing_comment_is_not_flagged(path, line, expected):
     assert set(rules(run(diff(path, [line])))) & {"code/eval", "code/shell"} == expected
+
+
+DOCSTRING = [
+    "def run(command):",
+    '    """Run a command for the user.',
+    "",
+    "    Never pass shell=True here, and never eval(command) either.",
+    '    """',
+    "    return command.split()",
+]
+
+
+def found_in(text, **kwargs):
+    """(rule, line) for every finding on a diff."""
+    return [(f.rule, f.line_start) for f in run(text, **kwargs)]
+
+
+def found(lines, path="app.py"):
+    """(rule, line) for every finding on a new file of `lines`."""
+    return found_in(diff(path, lines, new=True))
+
+
+def test_a_call_named_in_a_multi_line_docstring_is_not_flagged():
+    """#158: a line inside a docstring opened above is prose, whether the
+    whole file comes from a new file's diff or from its full text."""
+    path = "tools/run.py"
+    assert found(DOCSTRING, path) == []
+    modified = diff(path, DOCSTRING[3:], context=DOCSTRING[:3])
+    assert rules(run(modified, contents={path: "\n".join(DOCSTRING) + "\n"})) == []
+
+
+def test_part_of_a_file_is_read_as_code_throughout():
+    """Without the whole file there's no telling whether a hunk starts inside
+    a string, and a wrong guess hides real calls: here the first line shown
+    closes a docstring, and the eval after it runs."""
+    text = diff("app.py", ["    eval(request.args['code'])"], start=4, context=[
+        "    Long description line one.", "    Long description line two.", '    """',
+    ])
+    assert found_in(text) == [("code/eval", 7)]
+    # Nor does the docstring's prose get a pass when the diff shows where it opens.
+    assert rules(run(diff("tools/run.py", DOCSTRING[3:], context=DOCSTRING[:3]))) == ["code/eval", "code/shell"]
+
+
+@pytest.mark.parametrize("lines", [
+    ['# """', "eval(x)"],  # quotes in a comment open nothing
+    ["q = '\"\"\"'", "eval(x)"],  # nor quotes inside another string
+    ['s = """a', 'b"""; eval(x)'],  # code after the string closes
+    ['s = """a"""', "eval(x)"],  # a string that closes on its own line
+    ["s = '''a", "b''' + eval(x)"],
+    # A backslash continues a one-quote string, so the """ is inside it and opens nothing.
+    ["BANNER = 'deploy tool \\", "\"\"\"'", "eval(x)"],
+    # A nested f-string (3.12): a syntax error on 3.11, where nothing is skipped.
+    ['x = f"{"""a"""}"', "eval(x)"],
+])
+def test_code_around_triple_quotes_is_still_checked(lines):
+    assert found(lines) == [("code/eval", len(lines))]
+
+
+@pytest.mark.parametrize("lines,line", [
+    # An f-string's {...} is code. (3.11 also places the parts inside an f-string wrongly.)
+    (['x = f"""a', "{eval(x)}", '"""'], 2),
+    # The parser counts columns in UTF-8 bytes: each emoji is four of them but one character.
+    (['x = """a', '😀😀😀"""; eval(x)'], 2),
+    # Code before a string on the line it opens is code.
+    (['eval(x) + """a', 'b"""'], 1),
+])
+def test_code_next_to_a_multi_line_string_is_still_checked(lines, line):
+    assert found(lines) == [("code/eval", line)]
+
+
+def test_a_lone_carriage_return_skips_the_parse():
+    """Python breaks lines at a lone CR and `view` doesn't, so the parser's
+    line numbers would land a string's end on the eval after it."""
+    text = 'y = 1\rx = """a\nprose\n"""\neval(x)\n'
+    lines = text.split("\n")[:-1]
+    assert found_in(diff("app.py", lines, new=True), contents={"app.py": text}) == [("code/eval", 4)]
+
+
+@pytest.mark.parametrize("coding,flagged", [
+    # In UTF-7, +ACIAIgAi- is three double quotes: Python ends the string there and runs the eval.
+    ("# -*- coding: utf-7 -*-", True),
+    ("# vim: set fileencoding=latin-1 :", True),
+    ("# coding: no-such-codec", True),
+    ("# coding: " + "x" * 100, True),  # too long to be a codec: not looked up
+    # Python reads an encoding line on line 2 too: after a shebang, or after a first line it
+    # ignores, since its match is case-sensitive.
+    ("#!/usr/bin/env python\n# -*- coding: utf-7 -*-", True),
+    ("# CODING: utf-8\n# -*- coding: utf-7 -*-", True),
+    # UTF-8 is what the parse reads, so the string is skipped as usual.
+    ("# -*- coding: utf-8 -*-", False),
+    ("# coding=UTF8", False),
+    ("#!/usr/bin/env python\n# -*- coding: utf-8 -*-", False),
+])
+def test_a_file_in_another_encoding_is_read_as_code_throughout(coding, flagged):
+    head = coding.split("\n")
+    lines = [*head, 'x = """', "+ACIAIgAi-", "eval(code)", '"""', "z = 1 #+ACIAIgAi-"]
+    assert found(lines) == ([("code/eval", len(head) + 3)] if flagged else [])
+
+
+def test_a_name_too_long_to_be_a_codec_is_not_looked_up(monkeypatch):
+    """The codec registry keeps every name it fails to find, for the life of
+    the process: in the App, a stream of long names would add up."""
+    looked_up = []
+    monkeypatch.setattr(patterns, "codecs", SimpleNamespace(lookup=lambda name: looked_up.append(name)))
+    assert found(["# coding: " + "x" * 100, 'x = """', "eval(code)", '"""']) == [("code/eval", 3)]
+    assert looked_up == []
+
+
+def test_a_line_the_file_text_disagrees_on_is_judged_as_the_diff_shows_it():
+    """The file's text is fetched separately and can be a push behind the
+    diff: where the two differ on a line, the diff's added line is checked
+    whole."""
+    text = diff("app.py", ["y = 1", "eval(code)"], new=True)
+    assert found_in(text, contents={"app.py": 'x = """\n"""\n'}) == [("code/eval", 2)]
+
+
+def test_a_string_reopened_where_one_closes_is_followed():
+    assert found(['s = """a', 'b""" + """c', "never eval(x) here", '"""', "eval(y)"]) == [("code/eval", 5)]
+
+
+def test_an_escaped_quote_does_not_close_a_docstring():
+    assert found(['s = """a \\"""', "never eval(x) here", '"""']) == []
+
+
+def test_prose_in_a_string_is_not_read_as_the_call_a_shell_flag_belongs_to():
+    """`shell=True` is judged by the call above it. A `run("ls")` in a
+    string between them isn't that call: the real one runs `cmd`."""
+    lines = ["subprocess.run(", "    cmd,", '    input="""', '    then run("ls")', '    """,', "    shell=True,", ")"]
+    assert found(lines) == [("code/shell", 6)]
+
+
+def test_a_file_that_does_not_parse_is_read_as_code_throughout():
+    assert found(["def run(:", '    """Run it.', "    Never eval(x) here.", '    """']) == [("code/eval", 3)]
+
+
+def test_a_secret_in_a_docstring_is_still_found():
+    token = "ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1gI3kM5"
+    assert found(['"""Usage:', f"    login({token!r})", '"""']) == [("code/secret", 2)]
 
 
 @pytest.mark.parametrize("path,line", [
