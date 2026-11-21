@@ -111,6 +111,55 @@ def test_a_name_added_to_a_from_import_over_several_lines(tmp_path):
         assert f"This line imports {what}, which is in `db`." in finding.detail
 
 
+LONG_LIST = "from server import (\n    core,\n    a,\n    b,\n    c,\n    d,\n    e,\n    api,\n)\nx = 1\n"
+VIEWS = "diff --git a/server/api/views.py b/server/api/views.py\n--- a/server/api/views.py\n+++ b/server/api/views.py\n"
+NO_CLOSE = "@@ -1,5 +1,6 @@\n from server import (\n     core,\n+    db,\n     a,\n     b,\n     c,\n"  # `)` not shown
+NO_FROM = "@@ -5,5 +5,6 @@\n     c,\n     d,\n     e,\n+    db,\n     api,\n )\n"  # `from … import (` not shown
+
+
+def test_a_name_added_to_a_long_list_is_read_with_the_rest_of_the_file(tmp_path):
+    """The diff's context rarely shows both ends of a list black or isort
+    wrote one name to a line; the checkout fills in the lines it doesn't."""
+    repo = write(tmp_path, {**CHECKOUT, "server/api/views.py": LONG_LIST})
+    assert [f.line_start for f in boundary_findings(parse_diff(VIEWS + NO_CLOSE), POLICY, repo)] == [3]
+    assert [f.line_start for f in boundary_findings(parse_diff(VIEWS + NO_FROM), POLICY, repo)] == [8]
+    # Moved out of the list into a statement of its own: the removal is seen too, so it's no new import.
+    moved = LONG_LIST.replace("    e,\n", "    db,\n    e,\n") + "y = 2\n"
+    write(tmp_path, {"server/api/views.py": moved})
+    hunks = "@@ -5,4 +5,3 @@\n     c,\n     d,\n-    db,\n     e,\n@@ -12,1 +11,2 @@\n y = 2\n+from server import db\n"
+    assert boundary_findings(parse_diff(VIEWS + hunks), POLICY, repo) == []
+
+    # Without a checkout, a list still open where the diff stops is read to its end, but one whose
+    # `from` line isn't shown can't be.
+    assert [f.line_start for f in boundary_findings(parse_diff(VIEWS + NO_CLOSE), POLICY, None)] == [3]
+    assert boundary_findings(parse_diff(VIEWS + NO_FROM), POLICY, None) == []
+
+
+def test_a_checkout_that_does_not_match_the_diff_is_not_used_to_fill_it_in(tmp_path):
+    # The default branch moved on since the PR's base: a line was added at the top.
+    repo = write(tmp_path, {**CHECKOUT, "server/api/views.py": "import os\n" + LONG_LIST})
+    assert [f.line_start for f in boundary_findings(parse_diff(VIEWS + NO_CLOSE), POLICY, repo)] == [3]
+    assert boundary_findings(parse_diff(VIEWS + NO_FROM), POLICY, repo) == []
+
+
+def test_a_local_review_fills_in_the_file_from_its_base(tmp_path):
+    from test_repo_history import Repo
+
+    repo = Repo(tmp_path)
+    repo.commit({**CHECKOUT, "server/api/views.py": LONG_LIST}, day=1)
+    base = repo.git("rev-parse", "HEAD")
+    repo.commit({"server/api/views.py": LONG_LIST.replace("    api,\n", "    db,\n    api,\n")}, day=2)
+    assert [f.line_start for f in boundary_findings(parse_diff(VIEWS + NO_FROM), POLICY, repo.path, ref=base)] == [8]
+
+
+def test_names_kept_in_one_statement_do_not_hide_an_import_in_another(tmp_path):
+    repo = write(tmp_path, {**CHECKOUT, "server/api/views.py": "from server.db import (\n    Base,\n)\nx = 1\n"})
+    hunk = "@@ -1,4 +1,6 @@\n from server.db import (\n     Base,\n+    User,\n )\n x = 1\n+from server.db import Other\n"
+    for checkout in (repo, None):
+        # `User` loads what `Base` already did; line 6 is a new statement, so it's checked.
+        assert [f.line_start for f in boundary_findings(parse_diff(VIEWS + hunk), POLICY, checkout)] == [6]
+
+
 def test_imports_the_pr_did_not_add_are_left_alone(tmp_path):
     repo = write(tmp_path, CHECKOUT)
     diff = change("server/api/views.py", " from server.db.models import User", "+x = 1")
