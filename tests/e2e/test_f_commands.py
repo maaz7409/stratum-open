@@ -262,7 +262,7 @@ def test_help_says_who_may_run_each_command_as_the_policy_sets_it(reviewed, fake
         "/stratum review": "anyone",
         "/stratum ignore": "the PR's author or write access",
         "/stratum ignore <rule>": "the PR's author or write access",
-        "/stratum ignore <fingerprint>": None,
+        "/stratum ignore <fingerprint>": "ignore: the PR's author or write access; explain: write access",
         "/stratum mute <rule>": "write access",
         "/stratum explain": "write access; a few a day",
         "/stratum ask <question>": "write access; counts with explain",
@@ -273,6 +273,8 @@ def test_help_says_who_may_run_each_command_as_the_policy_sets_it(reviewed, fake
     assert handle(reviewed, *event("/stratum review", login="erin")) == "review"
     assert handle(reviewed, *event("/stratum record", login="erin")) == "refused"
     assert help_text(Commands()) == HELP
+    # A setting the policy file can't hold, from a Policy built in code: worded as `may_run` reads it.
+    assert "- `/stratum review`: review the whole PR again, not only what changed. *(write access)*" in help_text(Commands(review="admin"))
 
 
 @pytest.mark.parametrize("name", ["review", "re-review", "rereview", "ignore", "mute", "unmute", "explain", "triage", "record", "help"])
