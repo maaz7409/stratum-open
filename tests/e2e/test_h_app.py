@@ -311,6 +311,40 @@ def test_votes_from_users_without_write_access_are_ignored(fake_github, make_con
     assert storage.rule_votes("acme/widget") == {"model:unknown-id": (0, 1)}
 
 
+def test_a_vote_taken_back_stops_counting(fake_github, make_context, fake_model, tmp_path):
+    fake_github.add_pull(7, diff=DIFF)
+    fake_github.permissions.update({"mona": "write", "hubot": "write"})
+    fake_model.queue(Response.ok(json_reply([finding("app/users.py", SQL_LINE, line=5)])))
+    storage = SQLiteStorage(str(tmp_path / "s.db"))
+    ctx = make_context(storage=storage, feedback=True)
+    from stratum_open.runner import review_pull
+    review_pull(ctx, 7)
+    comment = next(c for c in fake_github.inline_comments(7) if "Unknown id" in c["body"])
+
+    def react(**by):
+        comment["reactions"] = {"+1": sum(v == "+1" for v in by.values()), "-1": sum(v == "-1" for v in by.values())}
+        fake_github.reactions[comment["id"]] = [{"content": v, "user": {"login": login}} for login, v in by.items()]
+
+    react(mona="-1", hubot="-1")
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 2
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (0, 2)}
+    react(mona="+1")  # hubot took theirs back, mona changed hers
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 1
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (1, 0)}
+
+    # GitHub won't say whether mona has write access: her stored vote stays rather than being dropped.
+    react(mona="+1", hubot="-1")
+    fake_github.fail("GET", r".*/collaborators/mona/permission", 403, body={"message": "Resource not accessible by integration"}, times=0)
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 1
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (1, 1)}
+
+    react()  # every vote taken back: the totals say so, and no reactions are read
+    reads = len(fake_github.requests)
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 0
+    assert storage.rule_votes("acme/widget") == {}
+    assert not any("/reactions" in r["path"] for r in fake_github.requests[reads:])
+
+
 @pytest.mark.parametrize("env, says", [
     ({}, "Missing settings: STRATUM_APP_ID, STRATUM_WEBHOOK_SECRET, STRATUM_APP_PRIVATE_KEY"),
     ({"STRATUM_APP_ID": "1", "STRATUM_WEBHOOK_SECRET": "s", "STRATUM_APP_PRIVATE_KEY_FILE": "/nope/key.pem"}, "Couldn't read STRATUM_APP_PRIVATE_KEY_FILE"),

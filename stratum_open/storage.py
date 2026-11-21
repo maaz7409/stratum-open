@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Iterator, Protocol
+from typing import Iterable, Iterator, Protocol
 
 from stratum_open.findings import Finding
 from stratum_open.util import redact
@@ -106,6 +106,11 @@ class Storage(Protocol):
     def record_vote(self, repo: str, rule: str, fingerprint: str, comment_id: int, voter: str, vote: int) -> None:
         """One vote per voter per comment: +1 or -1 replaces theirs, 0 removes it."""
 
+    def replace_votes(self, repo: str, rule: str, fingerprint: str, comment_id: int, votes: dict[str, int], *,
+                      keep: Iterable[str] = ()) -> None:
+        """A comment's votes become `votes` (voter -> +1 or -1), so a vote
+        taken back is gone; those of voters in `keep` are left as they are."""
+
     def rule_votes(self, repo: str) -> dict[str, tuple[int, int]]:
         """rule -> (👍, 👎)."""
 
@@ -150,6 +155,10 @@ class NullStorage:
         pass
 
     def record_vote(self, repo: str, rule: str, fingerprint: str, comment_id: int, voter: str, vote: int) -> None:
+        pass
+
+    def replace_votes(self, repo: str, rule: str, fingerprint: str, comment_id: int, votes: dict[str, int], *,
+                      keep: Iterable[str] = ()) -> None:
         pass
 
     def rule_votes(self, repo: str) -> dict[str, tuple[int, int]]:
@@ -257,6 +266,28 @@ class SQLiteStorage:
             else:
                 db.execute(
                     "INSERT OR REPLACE INTO votes (repo, comment_id, voter, rule, fingerprint, vote, voted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (*key, rule, fingerprint, vote, _stamp()),
+                )
+
+    def replace_votes(self, repo: str, rule: str, fingerprint: str, comment_id: int, votes: dict[str, int], *,
+                      keep: Iterable[str] = ()) -> None:
+        if bad := [vote for vote in votes.values() if vote not in (-1, 1)]:
+            raise ValueError(f"vote must be 1 or -1, not {bad[0]!r}")
+        votes = {voter.strip().lower(): vote for voter, vote in votes.items()}
+        left = {voter.strip().lower() for voter in keep} | set(votes)
+        with self._tx() as db:
+            stored = db.execute("SELECT voter FROM votes WHERE repo = ? AND comment_id = ?", (_repo(repo), comment_id)).fetchall()
+            db.executemany(
+                "DELETE FROM votes WHERE repo = ? AND comment_id = ? AND voter = ?",
+                [(_repo(repo), comment_id, row["voter"]) for row in stored if row["voter"] not in left],
+            )
+            for voter, vote in votes.items():
+                key = (_repo(repo), comment_id, voter)
+                # A vote that's the same as before keeps when it was cast.
+                db.execute(
+                    "INSERT INTO votes (repo, comment_id, voter, rule, fingerprint, vote, voted_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT (repo, comment_id, voter) DO UPDATE SET rule = excluded.rule, fingerprint = excluded.fingerprint,"
+                    " vote = excluded.vote, voted_at = excluded.voted_at WHERE vote != excluded.vote",
                     (*key, rule, fingerprint, vote, _stamp()),
                 )
 
