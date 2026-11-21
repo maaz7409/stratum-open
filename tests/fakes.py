@@ -75,6 +75,9 @@ class FakeGitHub:
     def open_pulls(self):
         return list(self.pulls.values())
 
+    def open_pulls_with_comments(self, limit):
+        return [{**pull, "comments": self.issue_comments(pull["number"])} for pull in list(self.pulls.values())[:limit]]
+
     def closed_pulls(self):
         return iter(sorted((p for p in self.pulls.values() if p["state"] == "closed"), key=lambda p: -p["number"]))
 

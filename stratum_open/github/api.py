@@ -23,6 +23,8 @@ TIMEOUT = 30  # seconds, per call
 RETRIES = 2  # extra tries on 5xx and rate limits
 WRITE = {"admin", "maintain", "write"}  # the permission() roles with write access
 _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
+_COMMENTS = "pageInfo{hasNextPage endCursor} nodes{databaseId body author{login __typename}}"  # a page of a PR's comments, in GraphQL
+PULL_PAGES = (50, 10)  # open PRs a query asks for, with their comments; the next size after GitHub gives up on one
 
 
 class GitHubError(Exception):
@@ -145,6 +147,68 @@ class GitHub:
 
     def open_pulls(self) -> list[dict]:
         return list(self.paginate(f"{self._r}/pulls", state="open"))
+
+    def open_pulls_with_comments(self, limit: int) -> list[dict]:
+        """The newest `limit` open PRs, drafts included, newest first as
+        `/pulls` lists them, each with its "comments" in `issue_comments`'
+        shape. A PR has only what the triage queue reads: "number", "title",
+        "draft" and "user". One GraphQL query per 50 PRs, and one more for
+        each further 100 comments on a PR with more than 100: 1 point of
+        GitHub's GraphQL rate limit each, and no REST calls.
+
+        GitHub gives up on a query after 10 seconds, and 50 PRs with long
+        comment threads can take longer. So a page it gives up on is asked
+        again with fewer PRs (`PULL_PAGES`), and the pages after it too, from
+        the same cursor: the order and the limit stay the same."""
+        owner, name = self.repo.split("/", 1)
+        pulls: list[dict] = []
+        cursor, sizes = None, list(PULL_PAGES)
+        while len(pulls) < limit:
+            try:
+                data = self.graphql(
+                    "query($owner:String!,$name:String!,$first:Int!,$cursor:String){repository(owner:$owner,name:$name)"
+                    "{pullRequests(states:OPEN,first:$first,after:$cursor,orderBy:{field:CREATED_AT,direction:DESC})"
+                    "{pageInfo{hasNextPage endCursor} nodes{number title isDraft author{login __typename}"
+                    "comments(first:100){" + _COMMENTS + "}}}}}",
+                    owner=owner, name=name, first=min(sizes[0], limit - len(pulls)), cursor=cursor,
+                )
+            except GitHubError as exc:
+                # A timeout is a GraphQL error (200) or the gateway's 502/504; a refusal or a rate limit isn't one.
+                if len(sizes) == 1 or exc.rate_limited or exc.status not in (200, 500, 502, 503, 504):
+                    raise
+                self.log(f"GitHub didn't answer a query for {sizes[0]} open PRs and their comments ({exc}); "
+                         f"asking for {sizes[1]} at a time.")
+                sizes.pop(0)
+                continue
+            page = (data.get("repository") or {}).get("pullRequests") or {}
+            for node in page.get("nodes") or []:
+                if isinstance(node, dict) and isinstance(node.get("number"), int):
+                    author = node.get("author")
+                    pulls.append({"number": node["number"], "title": node.get("title") or "", "draft": bool(node.get("isDraft")),
+                                  "user": {"login": _login(author)} if author else None,
+                                  "comments": self._all_comments(node["number"], node.get("comments") or {})})
+            info = page.get("pageInfo") or {}
+            if not info.get("hasNextPage") or not info.get("endCursor"):
+                break
+            cursor = info["endCursor"]
+        return pulls[:limit]
+
+    def _all_comments(self, number: int, page: dict) -> list[dict]:
+        """A PR's comments, from the first page of them a query brought on."""
+        owner, name = self.repo.split("/", 1)
+        comments: list[dict] = []
+        while True:
+            comments += [{"id": c.get("databaseId"), "body": c.get("body") or "", "user": {"login": _login(c.get("author"))}}
+                         for c in page.get("nodes") or [] if isinstance(c, dict)]
+            info = page.get("pageInfo") or {}
+            if not info.get("hasNextPage") or not info.get("endCursor"):
+                return comments
+            data = self.graphql(
+                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name)"
+                "{pullRequest(number:$number){comments(first:100,after:$cursor){" + _COMMENTS + "}}}}",
+                owner=owner, name=name, number=number, cursor=info["endCursor"],
+            )
+            page = ((data.get("repository") or {}).get("pullRequest") or {}).get("comments") or {}
 
     def closed_pulls(self) -> Iterator[dict]:
         """Closed PRs, merged or not, newest first. A page is fetched only
