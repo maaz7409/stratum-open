@@ -53,16 +53,18 @@ _WHO = {"anyone": "anyone", "author": "the PR's author or write access", "write"
 
 def help_text(commands: Commands) -> str:
     """The commands, each with who may run it under the policy's `commands`."""
+    def said(command: str) -> str:
+        return _WHO.get(getattr(commands, command), _WHO["write"])  # as `may_run` reads a setting it doesn't know
+
     def who(command: str, also: str = "", *, unless: str | None = None) -> str:
-        setting = getattr(commands, command)
-        return "" if setting == unless else f" *({_WHO[setting]}{also})*"
+        return "" if getattr(commands, command) == unless else f" *({said(command)}{also})*"
 
     return f"""Stratum commands, at the start of a line in a comment on this PR:
 
 - `/stratum review`: review the whole PR again, not only what changed.{who("review")}
 - `/stratum ignore`: as a reply to one of Stratum's inline comments, hide that finding on this PR.{who("ignore")}
 - `/stratum ignore <rule>`: hide every finding of a rule on this PR, e.g. `/stratum ignore workflow/unpinned-action`.{who("ignore")}
-- `/stratum ignore <fingerprint>` / `/stratum explain <fingerprint>`: the same as the replies, for the finding with that fingerprint, as a comment on the PR. An inline comment names its fingerprint where a reply can't reach Stratum: on a PR from a fork, with the GitHub Action.
+- `/stratum ignore <fingerprint>` / `/stratum explain <fingerprint>`: the same as the replies, for the finding with that fingerprint, as a comment on the PR. An inline comment names its fingerprint where a reply can't reach Stratum: on a PR from a fork, with the GitHub Action. *(ignore: {said("ignore")}; explain: {said("explain")})*
 - `/stratum mute <rule>` / `/stratum unmute <rule>`: hide a rule on every PR in this repo. Needs the GitHub App, which can store it.{who("mute")}
 - `/stratum explain`: as a reply to an inline comment, explain that finding in more detail.{who("explain", "; a few a day")}
 - `/stratum ask <question>`: answer a question about this PR from its diff and review; as a reply to an inline comment, about that comment's code.{who("explain", "; counts with explain")}

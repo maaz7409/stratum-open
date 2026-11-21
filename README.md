@@ -215,6 +215,8 @@ Every key, with its default, is in [policy.example.yml](policy.example.yml).
 
 Comment on a PR, with the command at the start of a line. One inside a code block (between ``` lines) is shown, not run.
 
+The "Who" column shows the defaults. The policy's `commands:` changes who may run each one, and `/stratum help` on a PR says what that repo's policy allows.
+
 | Command | Who | What it does |
 | --- | --- | --- |
 | `/stratum review` | write access | Review the whole PR again |
