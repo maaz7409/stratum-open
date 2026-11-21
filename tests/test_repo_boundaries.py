@@ -82,7 +82,33 @@ def test_an_import_continued_with_a_backslash(tmp_path):
     names = change("server/api/jobs.py", "+import os", "+from server import core, \\", "+    db", new=True)
     modules = change("server/api/tasks.py", "+import os, \\", "+    server.db.models", new=True)
     assert [(f.path, f.line_start) for f in boundary_findings([names, modules], POLICY, repo)] == [
-        ("server/api/jobs.py", 2), ("server/api/tasks.py", 1)]
+        ("server/api/jobs.py", 3), ("server/api/tasks.py", 2)]
+
+
+def test_a_name_added_to_a_from_import_over_several_lines(tmp_path):
+    """Black and isort put a long import's names one to a line: adding one adds
+    only its own line, and the finding goes there."""
+    repo = write(tmp_path, CHECKOUT)
+    head = "diff --git a/server/api/views.py b/server/api/views.py\n--- a/server/api/views.py\n+++ b/server/api/views.py\n"
+    cases = {
+        "@@ -1,4 +1,5 @@\n from server import (\n     core,\n+    db,\n )\n x = 1\n": [3],
+        "@@ -1,2 +1,3 @@\n-from server import core\n+from server import core, \\\n+    db\n x = 1\n": [2],
+        "@@ -1,3 +1,3 @@\n from server import core, \\\n-    api\n+    db\n x = 1\n": [2],
+        # The module changed, so every name now loads something new.
+        "@@ -1,3 +1,3 @@\n-from server.core import (\n+from server.db import (\n     models,\n )\n": [2],
+        # The names already there loaded `server.db`, so the new one adds nothing.
+        "@@ -1,3 +1,4 @@\n from server.db import (\n     Base,\n+    User,\n )\n": [],
+        "@@ -1,3 +1,3 @@\n from server import (\n-    db,\n+    db as database,\n )\n": [],
+    }
+    for hunk, lines in cases.items():
+        files = parse_diff(head + hunk)
+        assert [f.line_start for f in boundary_findings(files, POLICY, repo)] == lines, hunk
+        assert [f.line_start for f in boundary_findings(files, POLICY, None)] == lines, hunk
+    # Without a checkout, the name says what's imported when it, not the module, lands in `db`.
+    for module, what in (("server", "`server.db`"), ("..", "`..db`")):
+        files = parse_diff(head + f"@@ -1,3 +1,4 @@\n from {module} import (\n     core,\n+    db,\n )\n")
+        [finding] = boundary_findings(files, POLICY, None)
+        assert f"This line imports {what}, which is in `db`." in finding.detail
 
 
 def test_imports_the_pr_did_not_add_are_left_alone(tmp_path):

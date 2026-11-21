@@ -147,8 +147,14 @@ def test_an_import_continued_with_a_backslash_keeps_every_name():
     assert parse_imports("x.py", "from server import api, \\\n    db\n") == [Import(1, "server", ("api", "db"))]
     assert parse_imports("x.py", "from server import (api,\n    db)\n") == [Import(1, "server", ("api", "db"))]
     assert parse_imports("x.py", "import server.api, \\\n    server.db\nimport os\n") == [
-        Import(1, "server.api"), Import(1, "server.db"), Import(3, "os")]
+        Import(1, "server.api"), Import(2, "server.db"), Import(3, "os")]
     assert parse_imports("x.py", "from server import api, \\\r\n    db\r\n") == [Import(1, "server", ("api", "db"))]
+
+
+def test_each_name_of_a_from_import_keeps_its_line():
+    text = "import os\nfrom server import (\n    api,  # (the views)\n    db as database, cache,\n)\nfrom x import a, \\\n  b\n"
+    assert [(imp.names, imp.name_lines) for imp in parse_imports("x.py", text)] == [
+        ((), ()), (("api", "db", "cache"), (3, 4, 4)), (("a", "b"), (6, 7))]
 
 
 def test_parenthesized_import_keeps_names_after_a_comment_with_a_paren():

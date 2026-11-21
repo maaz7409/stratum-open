@@ -27,8 +27,10 @@ fool it.
 
 Only the line that names the module is checked, and only if the PR adds it:
 an import that was already there isn't this PR's doing, and neither is one
-the PR only reformats (removed and added back, loading the same file). One finding per module a file
-newly imports, naming the other lines that import it.
+the PR only reformats (removed and added back, loading the same file). A
+Python `from … import` spread over lines is read one name at a time, so a
+name added to the list is checked on its own line. One finding per module a
+file newly imports, naming the other lines that import it.
 """
 
 from __future__ import annotations
@@ -88,9 +90,12 @@ def boundary_findings(files: list[FileDiff], policy: Policy, repo_dir: str | Non
     for file in checked:
         source = module_of(file.path)
         # What the removed lines loaded: adding back an import of the same file only reformats it.
-        before = {what for imp in _removed_imports(file) for _, what, _ in _targets(resolver, file.path, imp, module_of, guess=not repo_dir)}
+        # So do the names left in place in a statement the PR adds a name to.
+        added, kept = _changed_imports(file.path, file.new_side(), {number for number, _ in file.added()})
+        before = {what for imp in _removed_imports(file) + kept
+                  for _, what, _ in _targets(resolver, file.path, imp, module_of, guess=not repo_dir)}
         by_target: dict[str, list[tuple[int, str, bool]]] = {}
-        for imp in added_imports(file):
+        for imp in added:
             for target, what, guessed in _targets(resolver, file.path, imp, module_of, guess=not repo_dir):
                 if target != source and what not in before:
                     by_target.setdefault(target, []).append((imp.line, what, guessed))
@@ -154,34 +159,39 @@ def _new_edge(file: FileDiff, source: str, target: str, line: int, what: str, al
     )
 
 
-def added_imports(file: FileDiff) -> list[Import]:
-    """Imports whose module is named on a line the PR adds. Each stretch of
-    lines the diff shows is read whole, so a JS import split over lines is
-    still seen when its `from '…'` line is added."""
-    added = {number for number, _ in file.added()}
-    if not added:
-        return []
-    found = []
-    for start, lines in _stretches(file.new_side()):
-        for imp in parse_imports(file.path, "\n".join(lines)):
-            number = start + imp.line - 1
-            if number in added:
-                found.append(replace(imp, line=number))
-    return found
-
-
 def _removed_imports(file: FileDiff) -> list[Import]:
-    """The imports named on lines the PR removes."""
+    """The imports, and the names of a `from … import`, on lines the PR removes."""
     old_side = {line.old: line.text for hunk in file.hunks for line in hunk.lines if line.old is not None}
     removed = {line.old for hunk in file.hunks for line in hunk.lines if line.kind == "-"}
-    if not removed:
-        return []
-    found = []
-    for start, lines in _stretches(old_side):
-        for imp in parse_imports(file.path, "\n".join(lines)):
-            if start + imp.line - 1 in removed:
-                found.append(imp)
-    return found
+    return _changed_imports(file.path, old_side, removed)[0]
+
+
+def _changed_imports(path: str, side: dict[int, str], changed: set[int]) -> tuple[list[Import], list[Import]]:
+    """The imports in `side` (line number to text) on a `changed` line, with
+    their line numbered as in `side`; and the names left on unchanged lines of
+    a `from … import` whose other names changed. A `from` statement is split
+    into one import for each name: a name is changed when its line is, or the
+    line naming the module is. Each stretch of lines the diff shows is read
+    whole, so a JS import split over lines is still seen when its `from '…'`
+    line is changed."""
+    if not changed:
+        return [], []
+    found: list[Import] = []
+    kept: list[Import] = []
+    for start, lines in _stretches(side):
+        for imp in parse_imports(path, "\n".join(lines)):
+            first = start + imp.line - 1
+            if not imp.names:
+                if first in changed:
+                    found.append(replace(imp, line=first))
+                continue
+            split = [replace(imp, line=start + at - 1, names=(name,), name_lines=(start + at - 1,))
+                     for name, at in zip(imp.names, imp.name_lines)]
+            touched = [one for one in split if first in changed or one.line in changed]
+            found += touched
+            if touched:
+                kept += [one for one in split if one not in touched]
+    return found, kept
 
 
 def _edges(repo_dir: str, files: list[str], module_of: Callable[[str], str | None], ref: str | None = None) -> set[tuple[str, str]]:
@@ -216,10 +226,15 @@ def _targets(resolver: Resolver, importer: str, imp: Import, module_of: Callable
     if resolved or not guess:
         return [(module, f"`{path}`", False) for path in resolved if (module := module_of(path))]
     found = []
-    for group in resolver.candidates(importer, imp):
+    named = f"{'.' * imp.level}{imp.module}"
+    [own] = resolver.candidates(importer, replace(imp, names=())) or [[]]
+    own_landing = {module_of(path) for path in own} - {None}
+    for group, name in zip(resolver.candidates(importer, imp), imp.names or ("",)):
         landing = {module_of(path) for path in group} - {None}
         if len(landing) == 1:
-            found.append((landing.pop(), f"`{'.' * imp.level}{imp.module}`", True))
+            # `from server import db` lands in `db` because of the name, so it's named too.
+            what = (named + "." * bool(imp.module) + name) if name and landing != own_landing else named
+            found.append((landing.pop(), f"`{what}`", True))
     return found
 
 
