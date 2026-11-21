@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import json
 import re
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from stratum_open import diff as diffs
 from stratum_open.diff import FileDiff, Packed
 from stratum_open.findings import CATEGORIES, SEVERITIES, Finding
-from stratum_open.model import Model, Reply, parse_json, salvage
+from stratum_open.model import Model, Reply, is_model_failure, parse_json, salvage
 from stratum_open.policy import Policy
 
 OUTPUT_RESERVE_TOKENS = 2048
@@ -346,14 +347,39 @@ def review(
     return result
 
 
+def call_model(model: Any, system: str, user: str, max_tokens: int) -> tuple[Reply, dict[str, Any]]:
+    """One model call, and its entry for a review's `calls`. It never raises:
+    `Model.complete` reports its own failures in its Reply, but a model built
+    in code may raise, and one call that does shouldn't lose the others. An
+    exception `is_model_failure` counts as the model not answering; anything
+    else is named as a bug. The message is left out, as it may carry a
+    secret; the traceback rides along for the log."""
+    try:
+        reply = model.complete(system, user, max_tokens=max_tokens)
+    except Exception as exc:
+        kind = type(exc).__name__
+        error = (f"the model call failed ({kind})" if is_model_failure(exc, model)
+                 else f"Stratum hit a bug during the model step ({kind})")
+        call = failed_call(model, error, traceback.format_exc())
+        return Reply("", call["model"], 0.0, error=error), call
+    return reply, reply.as_dict()
+
+
+def failed_call(model: Any, error: str, trace: str = "") -> dict[str, Any]:
+    """The entry in `calls` for a call that never got a reply."""
+    call = Reply("", str(getattr(model, "name", "")), 0.0, error=error).as_dict()
+    if trace:
+        call["traceback"] = trace
+    return call
+
+
 def _ask(model: Model, system: str, user: str, policy: Policy, log: Callable[[str, str], None] | None,
          calls: list[dict[str, Any]], label: str) -> tuple[dict[str, Any] | None, bool]:
     """One call of the chunked review, added to `calls` (with `label` as its
     pass, when it isn't the review's first answer). Returns the reply's JSON
     object, or None when the call failed or the reply held none, and whether
     the reply was read in full."""
-    reply = model.complete(system, user, max_tokens=OUTPUT_RESERVE_TOKENS)
-    call = reply.as_dict()
+    reply, call = call_model(model, system, user, OUTPUT_RESERVE_TOKENS)
     if label:
         call["pass"] = label
     calls.append(call)
@@ -435,11 +461,7 @@ def verify_findings(findings: list[Finding], files: list[FileDiff], policy: Poli
             continue
         code = _excerpt(file, finding.line_start, policy.review.diff_format)
         user = f"The changed code:\n{code}\n\nThe finding, on line {finding.line_start}:\n{finding.title}: {finding.detail}"
-        try:
-            reply = model.complete(system, user, max_tokens=max_tokens)
-        except Exception as exc:  # an embedder's model may raise; the engine's own reports failures in its Reply
-            reply = Reply("", str(getattr(model, "name", "")), 0.0, error=f"the model call failed ({type(exc).__name__})")
-        call = reply.as_dict()
+        reply, call = call_model(model, system, user, max_tokens)
         call["pass"] = "verify"
         calls.append(call)
         if log and policy.review.log_prompts:

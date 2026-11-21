@@ -227,6 +227,29 @@ def test_a_finding_on_a_file_the_model_was_not_shown_is_dropped():
     assert "vendor/lib/thing.py" in result.packed.omitted and result.findings == [] and result.dropped == 1
 
 
+def test_a_model_that_raises_on_one_chunk_loses_only_that_chunk():
+    big = "".join(
+        f"diff --git a/f{i}.py b/f{i}.py\n--- a/f{i}.py\n+++ b/f{i}.py\n@@ -1 +1,40 @@\n x\n" + "".join(f"+line {n} " * 20 + "\n" for n in range(40))
+        for i in range(2)
+    )
+
+    class FailsFirst(FakeModel):
+        failure_types = (TimeoutError,)
+
+        def complete(self, system, user, **kwargs):
+            if not self.prompts:
+                self.prompts.append((system, user))
+                raise TimeoutError("read timed out")
+            return super().complete(system, user, **kwargs)
+
+    model = FailsFirst(answer(findings=[], summary="The second part."))
+    result = review(title="t", description="d", files=parse_diff(big), policy=parse_policy("review:\n  context_tokens: 4000\n"), model=model)
+    first, second = result.calls
+    assert (first["ok"], first["error"], "Traceback" in first["traceback"]) == (False, "the model call failed (TimeoutError)", True)
+    assert second["ok"] and result.ran and result.failed_calls == 1 and result.summary == "The second part."
+    assert result.unread == set(result.packed.chunk_paths[0]) and not result.unusable  # timed out: not known to repeat
+
+
 def test_the_worst_description_answer_wins_across_chunks():
     big = "".join(
         f"diff --git a/f{i}.py b/f{i}.py\n--- a/f{i}.py\n+++ b/f{i}.py\n@@ -1 +1,40 @@\n x\n" + "".join(f"+line {n} " * 20 + "\n" for n in range(40))

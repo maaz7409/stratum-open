@@ -968,20 +968,45 @@ def small_and_big():
             f"diff --git a/app/big.py b/app/big.py\nnew file mode 100644\n--- /dev/null\n+++ b/app/big.py\n@@ -0,0 +1,600 @@\n{big}")
 
 
-@pytest.mark.parametrize("first", ["crash", "no model"])
-def test_a_file_the_size_limit_never_sends_doesnt_stay_unread(gh, first):
+@pytest.mark.parametrize("exc, outage", [(TimeoutError("slow"), True), (RuntimeError("broke"), False)])
+def test_the_coverage_line_calls_an_outage_one_and_a_bug_not(gh, exc, outage):
+    class Raises(FakeModel):
+        failure_types = (TimeoutError,)
+
+        def complete(self, system, user, **kwargs):
+            raise exc
+
+    review_pull(context(gh, Raises()), 7)
+    body = gh.issue_comments_[7][0]["body"]
+    assert ("but it didn't answer, so they weren't reviewed" in body) == outage
+    assert ("Stratum hit a bug during the model step (RuntimeError), so this review has only the checks." in body) == (not outage)
+
+
+@pytest.mark.parametrize("first, unread", [
+    ("crash", {"app/small.py"}),  # only the call failed: big was left out by the size limit, as on any review
+    ("bug", {"app/small.py", "app/big.py"}),  # the model step itself failed: no telling what was read
+    ("no model", {"app/small.py", "app/big.py"}),
+])
+def test_a_file_the_size_limit_never_sends_doesnt_stay_unread(gh, monkeypatch, first, unread):
     class Raises(FakeModel):
         def complete(self, system, user, **kwargs):
             raise RuntimeError("the embedder's model broke")
 
+    def broken(**kwargs):
+        raise KeyError("file")
+
     gh.diff = small_and_big()
     skip = parse_policy("review:\n  profile: small\n  context_tokens: 6000\n  large_patch: skip\n")
-    review_pull(context(gh, Raises() if first == "crash" else None, policy=skip), 7)
-    assert set(publish.State.decode(gh.issue_comments_[7][0]["body"]).unread) == {"app/small.py", "app/big.py"}
+    with monkeypatch.context() as patched:
+        if first == "bug":
+            patched.setattr("stratum_open.engine.review", broken)
+        review_pull(context(gh, None if first == "no model" else Raises(), policy=skip), 7)
+    assert set(publish.State.decode(gh.issue_comments_[7][0]["body"]).unread) == unread
 
     def healthy(**kwargs):
         outcome = review_pull(context(gh, FakeModel(model_answer(findings=[])), policy=skip), 7, **kwargs)
-        assert "app/big.py" in outcome.review.packed.omitted if outcome.review else True
+        sent = set(outcome.review.packed.reviewed + outcome.review.packed.clipped) if outcome.review else set()
+        assert "app/big.py" not in sent
         assert publish.State.decode(gh.issue_comments_[7][0]["body"]).unread == []
         assert gh.checks[-1]["conclusion"] == "success"
 
