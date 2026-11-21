@@ -130,9 +130,9 @@ def analyze(
             # a model that raises into a failed call (`review.call_model`), so what lands here is most
             # likely a bug of ours, and is named as one rather than as an outage.
             if is_model_failure(exc, model):
-                error = f"the model step failed ({type(exc).__name__}): {exc}"
+                error = f"the model step failed ({type(exc).__name__})"
             else:
-                error = f"Stratum hit a bug during the model step ({type(exc).__name__}): {exc}"
+                error = f"Stratum hit a bug during the model step ({type(exc).__name__})"
             result = ReviewResult(failed_calls=1, calls=[failed_call(model, error, traceback.format_exc())],
                                   unread={f.path for f in files  # no telling what was read, of what would have been sent
                                           if (only_paths is None or f.path in only_paths) and sendable(f, policy.ignored)})

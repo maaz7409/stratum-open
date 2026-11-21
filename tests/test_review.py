@@ -6,7 +6,7 @@ from fakes import FakeModel
 from stratum_open.diff import parse_diff
 from stratum_open.model import Reply, parse_json
 from stratum_open.policy import parse_policy
-from stratum_open.review import COMMAND, demention, parse, review
+from stratum_open.review import COMMAND, call_model, demention, parse, review
 
 DIFF = """diff --git a/app/users.py b/app/users.py
 --- a/app/users.py
@@ -523,3 +523,30 @@ def test_demention_never_leaves_a_line_that_reads_as_a_command(text):
 def test_a_long_s_command_is_put_in_code_where_it_starts():
     assert demention("```\n/ſtratum review\n```") == "```\n`/ſtratum` review\n```"
     assert demention("`x\n\t/ſTRATUM review") == "`x\n\t`/ſTRATUM` review"
+
+
+def test_call_model_never_raises_on_an_answer_that_is_not_a_reply():
+    class ReturnsNone:
+        name = "none-model"
+
+        def complete(self, system, user, **kwargs):
+            return None
+
+    reply, call = call_model(ReturnsNone(), "system", "user", 100)
+    assert not reply.ok and reply.error == call["error"] == "Stratum hit a bug during the model step (NoneType)"
+    assert call["traceback"] == "ReturnsNone.complete returned NoneType, not a Reply" and call["model"] == "none-model"
+
+
+def test_call_model_passes_json_mode_only_when_asked():
+    seen = []
+
+    class Records:
+        name = "m"
+
+        def complete(self, system, user, **kwargs):
+            seen.append(kwargs)
+            return Reply("ok", "m", 0.1)
+
+    call_model(Records(), "s", "u", 100)
+    call_model(Records(), "s", "u", 100, json_mode=False)
+    assert seen == [{"max_tokens": 100}, {"max_tokens": 100, "json_mode": False}]
