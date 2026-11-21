@@ -982,6 +982,62 @@ def test_the_coverage_line_calls_an_outage_one_and_a_bug_not(gh, exc, outage):
     assert ("Stratum hit a bug during the model step (RuntimeError), so this review has only the checks." in body) == (not outage)
 
 
+def test_the_coverage_line_says_the_model_did_not_answer_when_a_bug_came_with_an_outage():
+    errors = iter([RuntimeError("broke"), TimeoutError("slow")])
+
+    class Raises(FakeModel):
+        failure_types = (TimeoutError,)
+
+        def complete(self, system, user, **kwargs):
+            raise next(errors)
+
+    gh = FakeGitHub(diff=two_files())
+    outcome = review_pull(context(gh, Raises(), policy=SPLIT), 7)
+    assert len(outcome.review.calls) == 2
+    body = gh.issue_comments_[7][0]["body"]
+    assert "but it didn't answer, so they weren't reviewed" in body
+    assert "Stratum hit a bug during the model step (RuntimeError), so this review has only the checks." in body
+
+
+def test_a_per_file_pass_that_raises_is_logged_with_its_traceback(gh):
+    class RaisesPerFile(FakeModel):
+        """Answers the chunked review; raises on each per-file call."""
+
+        def complete(self, system, user, **kwargs):
+            if "Review one file's changes" in system:
+                raise RuntimeError("broke")
+            return super().complete(system, user, **kwargs)
+
+    logged = []
+    per_file = parse_policy("review:\n  profile: large\n  file_reviews: 1\n  lens_files: 0\n  walkthrough: false\n")
+    outcome = review_pull(Context(gh=gh, policy=per_file, model=RaisesPerFile(model_answer()), bot=BOT, log=logged.append), 7)
+    assert outcome.review.calls and not any(call.get("traceback") for call in outcome.review.calls)
+    [line] = [line for line in logged if line.startswith("model review failed")]
+    assert line.startswith("model review failed: Stratum hit a bug during the model step (RuntimeError)\nTraceback")
+
+
+def test_explain_and_ask_answer_when_the_model_raises(gh):
+    class AnswersOnce(FakeModel):
+        failure_types = (TimeoutError,)
+
+        def complete(self, system, user, **kwargs):
+            if self.prompts:
+                raise TimeoutError("read timed out")
+            return super().complete(system, user, **kwargs)
+
+    logged = []
+    ctx = context(gh, AnswersOnce(model_answer()))
+    ctx.log = logged.append
+    review_pull(ctx, 7)
+    inline = next(c for c in gh.review_comments_ if "Dead code" in c["body"])
+    assert handle(ctx, *comment_event("/stratum explain", login="carol", inline_reply_to=inline["id"])) == "explain"
+    assert handle(ctx, *comment_event("/stratum ask what does this change?", login="carol")) == "ask"
+    said = [c["body"] for c in gh.review_comments_ if c.get("in_reply_to_id")] + [c["body"] for c in gh.issue_comments_[7][1:]]
+    assert sum("The model couldn't answer just now (the model call failed (TimeoutError)). Try again later." in body for body in said) == 2
+    assert all("read timed out" not in body for body in said)  # the message stays in the log
+    assert sum(line.startswith("model call failed: the model call failed (TimeoutError)\nTraceback") for line in logged) == 2
+
+
 @pytest.mark.parametrize("first, unread", [
     ("crash", {"app/small.py"}),  # only the call failed: big was left out by the size limit, as on any review
     ("bug", {"app/small.py", "app/big.py"}),  # the model step itself failed: no telling what was read

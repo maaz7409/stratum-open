@@ -347,20 +347,27 @@ def review(
     return result
 
 
-def call_model(model: Any, system: str, user: str, max_tokens: int) -> tuple[Reply, dict[str, Any]]:
+def call_model(model: Any, system: str, user: str, max_tokens: int, *, json_mode: bool | None = None) -> tuple[Reply, dict[str, Any]]:
     """One model call, and its entry for a review's `calls`. It never raises:
     `Model.complete` reports its own failures in its Reply, but a model built
     in code may raise, and one call that does shouldn't lose the others. An
     exception `is_model_failure` counts as the model not answering; anything
-    else is named as a bug. The message is left out, as it may carry a
-    secret; the traceback rides along for the log."""
+    else, or an answer that isn't a Reply, is named as a bug. The message is
+    left out, as it may carry a secret; the traceback rides along for the
+    log. `json_mode` is passed on only when it's given."""
+    options = {} if json_mode is None else {"json_mode": json_mode}
     try:
-        reply = model.complete(system, user, max_tokens=max_tokens)
+        reply = model.complete(system, user, max_tokens=max_tokens, **options)
     except Exception as exc:
         kind = type(exc).__name__
         error = (f"the model call failed ({kind})" if is_model_failure(exc, model)
                  else f"Stratum hit a bug during the model step ({kind})")
         call = failed_call(model, error, traceback.format_exc())
+        return Reply("", call["model"], 0.0, error=error), call
+    if not isinstance(reply, Reply):
+        kind = type(reply).__name__
+        error = f"Stratum hit a bug during the model step ({kind})"
+        call = failed_call(model, error, f"{type(model).__name__}.complete returned {kind}, not a Reply")
         return Reply("", call["model"], 0.0, error=error), call
     return reply, reply.as_dict()
 

@@ -348,3 +348,16 @@ def test_a_per_file_call_that_failed_on_a_file_the_chunked_review_read_isnt_unre
                            json.dumps({"summary": "Adds token checks.", "matches_description": "yes", "findings": []}), "not json")
     assert "the chunked review still covered those files." in body
     assert publish.State.decode(body).unread == []
+
+
+def test_a_call_that_raised_is_in_the_prompt_log():
+    class Raises(FakeModel):
+        failure_types = (TimeoutError,)
+
+        def complete(self, system, user, **kwargs):
+            raise TimeoutError("read timed out")
+
+    logged = []
+    result = run(Raises(), "  log_prompts: true\n", log=lambda prompt, reply: logged.append((prompt, reply)))
+    assert result.failed_calls and len(logged) == len(result.calls)
+    assert all(reply == "" and prompt for prompt, reply in logged)

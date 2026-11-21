@@ -149,7 +149,8 @@ def test_a_bug_in_the_model_step_itself_is_named_as_one(monkeypatch):
     monkeypatch.setattr("stratum_open.engine.review", broken)
     result = run(FakeModel(reply(UNKNOWN_ID)))
     [call] = result.review.calls
-    assert call["error"] == "Stratum hit a bug during the model step (KeyError): 'file'" and "Traceback" in call["traceback"]
+    assert call["error"] == "Stratum hit a bug during the model step (KeyError)"  # the message may carry a secret: only the log has it
+    assert "Traceback" in call["traceback"] and "KeyError: 'file'" in call["traceback"]
     assert not result.review.ran and {f.rule for f in result.findings} >= {"code/sql"}  # the checks still report
 
 
