@@ -38,7 +38,7 @@ This applies to the GitHub App. The Action and the CLI store none of it.
 | Data | Default retention | How it's deleted |
 | --- | --- | --- |
 | Review findings and summaries | 180 days; the PR comments stay on GitHub | Automatically, or `stratum-open data delete --repo owner/name --pr <number>` |
-| 👍/👎 feedback and muted rules | Until a maintainer deletes them | `stratum-open data delete --feedback [--repo owner/name]`; unmuting a rule also deletes its votes, and a vote taken back on GitHub is deleted at the PR's next review |
+| 👍/👎 feedback and muted rules | Until a maintainer deletes them | `stratum-open data delete --feedback [--repo owner/name]`; unmuting a rule also deletes its votes, and a vote taken back on GitHub is deleted when a push gets the PR reviewed again |
 | Track records | Not stored: rebuilt from git history on every run | Nothing to delete; `track_record.exclude` stops one being built |
 | Job log: PR, event, time, outcome, errors | 14 days | Automatically, or with the PR's findings by `stratum-open data delete --repo owner/name --pr <number>` |
 | A clone of each repo's default branch, with the history in `track_record.window_days` | On the App's disk while the App is installed; updated on each run | Deleted at once when the App is uninstalled from the repo |
@@ -98,10 +98,14 @@ finding's suggested fix and replacement code are never kept.
 - `jobs.created_at`: when it ran.
 
 **votes:** 👍/👎 reactions on the App's comments. Kept until a maintainer
-deletes them, or until the vote is taken back: each time the App reviews a
-PR, it reads the reactions on that PR's comments again, and deletes a stored
-vote that's no longer there or whose voter no longer has write access. A vote
-stays when GitHub won't say whether its voter has write access.
+deletes them, or until the vote is taken back: when a push to a PR (or
+another event in `review.events`) gets it reviewed again, the App reads the
+reactions on that PR's comments and deletes a stored vote that's no longer
+there or whose voter no longer has write access. `/stratum review`, and an
+event the policy skips, don't read them. When GitHub won't say whether a
+voter has write access, a vote of theirs already stored follows their
+current 👍 or 👎, and none is added. A merged or closed PR isn't reviewed
+again, so a vote taken back there stays until a maintainer deletes it.
 
 - `votes.repo`: the repo.
 - `votes.comment_id`: the comment reacted to.

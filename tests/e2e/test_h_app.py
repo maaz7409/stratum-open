@@ -337,12 +337,49 @@ def test_a_vote_taken_back_stops_counting(fake_github, make_context, fake_model,
     fake_github.fail("GET", r".*/collaborators/mona/permission", 403, body={"message": "Resource not accessible by integration"}, times=0)
     assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 1
     assert storage.rule_votes("acme/widget") == {"model:unknown-id": (1, 1)}
+    react(mona="-1", hubot="-1")  # ... and follows her reaction when she changes it
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 1
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (0, 2)}
 
     react()  # every vote taken back: the totals say so, and no reactions are read
     reads = len(fake_github.requests)
     assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 0
     assert storage.rule_votes("acme/widget") == {}
     assert not any("/reactions" in r["path"] for r in fake_github.requests[reads:])
+
+
+def test_a_voter_whose_access_cannot_be_checked_gets_no_new_vote(fake_github, make_context, fake_model, tmp_path):
+    fake_github.add_pull(7, diff=DIFF)
+    fake_github.permissions.update({"mona": "write", "hubot": "write"})
+    fake_model.queue(Response.ok(json_reply([finding("app/users.py", SQL_LINE, line=5),
+                                             finding("app/users.py", 'print("unreachable")', title="Dead code", severity="medium")])))
+    storage = SQLiteStorage(str(tmp_path / "s.db"))
+    ctx = make_context(storage=storage, feedback=True)
+    from stratum_open.runner import review_pull
+    review_pull(ctx, 7)
+    unknown, dead = (next(c for c in fake_github.inline_comments(7) if title in c["body"]) for title in ("Unknown id", "Dead code"))
+
+    def react(comment, **by):
+        comment["reactions"] = {"+1": sum(v == "+1" for v in by.values()), "-1": sum(v == "-1" for v in by.values())}
+        fake_github.reactions[comment["id"]] = [{"content": v, "user": {"login": login}} for login, v in by.items()]
+
+    react(unknown, mona="-1")
+    react(dead, mona="-1")
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 2
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (0, 1), "model:dead-code": (0, 1)}
+
+    # Now no one's access can be checked. mona still reacts on one comment and took hers back on the
+    # other, where hubot's 👍 means the reactions are read; dave reacts for the first time.
+    fake_github.fail("GET", r".*/collaborators/.*/permission", 403, body={"message": "Resource not accessible by integration"}, times=0)
+    react(unknown, mona="-1", dave="-1")
+    react(dead, hubot="+1")
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 0
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (0, 1)}
+
+    # A comment listed without its reaction totals has its reactions read rather than taken as none.
+    del unknown["reactions"]
+    assert collect_votes(ctx.gh, 7, fake_github.bot, storage) == 0
+    assert storage.rule_votes("acme/widget") == {"model:unknown-id": (0, 1)}
 
 
 @pytest.mark.parametrize("env, says", [

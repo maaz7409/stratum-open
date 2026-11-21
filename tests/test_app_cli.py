@@ -419,6 +419,30 @@ def test_the_job_skips_what_the_repos_policy_says(server, monkeypatch):
     assert server.storage.export("acme/widget")["jobs"][-1]["outcome"] == "skipped"
 
 
+def test_the_review_goes_on_when_reading_reactions_fails(server, monkeypatch):
+    import requests
+
+    from stratum_open.policy import Policy
+    from stratum_open.runner import Context, Outcome
+
+    reviewed, logged = [], []
+    monkeypatch.setattr(server, "context", lambda installation, repo, branch: Context(gh=None, policy=Policy(), model=None, bot="b[bot]"))
+    monkeypatch.setattr(server, "log", logged.append)
+
+    def unreachable(*args):
+        raise requests.ConnectionError("Connection reset by peer")
+
+    def review(ctx, number):
+        reviewed.append(number)
+        return Outcome(number, "reviewed")
+
+    monkeypatch.setattr("stratum_open.app.collect_votes", unreachable)
+    monkeypatch.setattr("stratum_open.app.review_pull", review)
+    server.run("pull_request", json.loads(pr_event(number=11)))
+    assert reviewed == [11]
+    assert logged == ["acme/widget#11: couldn't read reactions: ConnectionError: Connection reset by peer"]
+
+
 def test_triage_post_with_a_personal_token_edits_its_own_queue_issue(monkeypatch, capsys):
     from fakes import FakeGitHub
 

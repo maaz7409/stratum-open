@@ -54,21 +54,25 @@ class _Access:
 
 def collect_votes(gh: GitHub, number: int, bot: str, storage: Storage) -> int:
     """Store the write-access 👍/👎 on this PR's Stratum comments as they are
-    now, so a vote taken back stops counting. A stored vote is kept when
-    GitHub won't say whether its voter has write access. Returns how many
-    votes were recorded."""
+    now, so a vote taken back stops counting. When GitHub won't say whether
+    a voter has write access, a vote of theirs already stored follows their
+    current reaction, and none is added. Returns how many votes were
+    recorded."""
     maintainer = _Access(gh)
     recorded = 0
     for comment, fp, rule in _marked(gh.review_comments(number), bot):
         totals = comment.get("reactions")
         votes: dict[str, int] = {}
-        reactors: set[str] = set()
+        unsure: dict[str, int] = {}
         # The totals come with the comment, so one with no 👍 or 👎 costs no call.
         if totals is None or totals.get("+1") or totals.get("-1"):
             reactions = gh.reactions(comment["id"])
             votes = dict(_votes(reactions, maintainer))
-            reactors = {(r.get("user") or {}).get("login", "").lower() for r in reactions if r.get("content") in VOTES}
-        storage.replace_votes(gh.repo, rule, fp, comment["id"], votes, keep=maintainer.unsure & reactors)
+            for reaction in reactions:  # after `_votes`, which asked about each voter
+                login = ((reaction.get("user") or {}).get("login") or "").lower()
+                if login in maintainer.unsure and reaction.get("content") in VOTES:
+                    unsure[login] = VOTES[reaction["content"]]
+        storage.replace_votes(gh.repo, rule, fp, comment["id"], votes, unsure=unsure)
         recorded += len(votes)
     return recorded
 

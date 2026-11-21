@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Iterator, Protocol
+from typing import Iterator, Protocol
 
 from stratum_open.findings import Finding
 from stratum_open.util import redact
@@ -107,9 +107,11 @@ class Storage(Protocol):
         """One vote per voter per comment: +1 or -1 replaces theirs, 0 removes it."""
 
     def replace_votes(self, repo: str, rule: str, fingerprint: str, comment_id: int, votes: dict[str, int], *,
-                      keep: Iterable[str] = ()) -> None:
+                      unsure: dict[str, int] | None = None) -> None:
         """A comment's votes become `votes` (voter -> +1 or -1), so a vote
-        taken back is gone; those of voters in `keep` are left as they are."""
+        taken back is gone. `unsure`: the current votes of voters whose
+        write access couldn't be checked; a stored vote of theirs becomes
+        that one, and none is added."""
 
     def rule_votes(self, repo: str) -> dict[str, tuple[int, int]]:
         """rule -> (👍, 👎)."""
@@ -158,7 +160,7 @@ class NullStorage:
         pass
 
     def replace_votes(self, repo: str, rule: str, fingerprint: str, comment_id: int, votes: dict[str, int], *,
-                      keep: Iterable[str] = ()) -> None:
+                      unsure: dict[str, int] | None = None) -> None:
         pass
 
     def rule_votes(self, repo: str) -> dict[str, tuple[int, int]]:
@@ -270,11 +272,12 @@ class SQLiteStorage:
                 )
 
     def replace_votes(self, repo: str, rule: str, fingerprint: str, comment_id: int, votes: dict[str, int], *,
-                      keep: Iterable[str] = ()) -> None:
-        if bad := [vote for vote in votes.values() if vote not in (-1, 1)]:
+                      unsure: dict[str, int] | None = None) -> None:
+        if bad := [vote for vote in [*votes.values(), *(unsure or {}).values()] if vote not in (-1, 1)]:
             raise ValueError(f"vote must be 1 or -1, not {bad[0]!r}")
         votes = {voter.strip().lower(): vote for voter, vote in votes.items()}
-        left = {voter.strip().lower() for voter in keep} | set(votes)
+        unsure = {voter.strip().lower(): vote for voter, vote in (unsure or {}).items() if voter.strip().lower() not in votes}
+        left = set(unsure) | set(votes)
         with self._tx() as db:
             stored = db.execute("SELECT voter FROM votes WHERE repo = ? AND comment_id = ?", (_repo(repo), comment_id)).fetchall()
             db.executemany(
@@ -290,6 +293,10 @@ class SQLiteStorage:
                     " vote = excluded.vote, voted_at = excluded.voted_at WHERE vote != excluded.vote",
                     (*key, rule, fingerprint, vote, _stamp()),
                 )
+            db.executemany(
+                "UPDATE votes SET vote = ?, voted_at = ? WHERE repo = ? AND comment_id = ? AND voter = ? AND vote != ?",
+                [(vote, _stamp(), _repo(repo), comment_id, voter, vote) for voter, vote in unsure.items()],
+            )
 
     def rule_votes(self, repo: str) -> dict[str, tuple[int, int]]:
         with self._tx() as db:
