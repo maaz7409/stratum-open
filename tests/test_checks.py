@@ -254,6 +254,47 @@ def test_code_around_triple_quotes_is_still_checked(lines):
     assert found(lines) == [("code/eval", len(lines))]
 
 
+@pytest.mark.parametrize("lines,line", [
+    # An f-string's {...} is code. (3.11 also places the parts inside an f-string wrongly.)
+    (['x = f"""a', "{eval(x)}", '"""'], 2),
+    # The parser counts columns in UTF-8 bytes: each emoji is four of them but one character.
+    (['x = """a', '😀😀😀"""; eval(x)'], 2),
+    # Code before a string on the line it opens is code.
+    (['eval(x) + """a', 'b"""'], 1),
+])
+def test_code_next_to_a_multi_line_string_is_still_checked(lines, line):
+    assert found(lines) == [("code/eval", line)]
+
+
+def test_a_lone_carriage_return_skips_the_parse():
+    """Python breaks lines at a lone CR and `view` doesn't, so the parser's
+    line numbers would land a string's end on the eval after it."""
+    text = 'y = 1\rx = """a\nprose\n"""\neval(x)\n'
+    lines = text.split("\n")[:-1]
+    assert found_in(diff("app.py", lines, new=True), contents={"app.py": text}) == [("code/eval", 4)]
+
+
+@pytest.mark.parametrize("coding,expected", [
+    # In UTF-7, +ACIAIgAi- is three double quotes: Python ends the string there and runs the eval.
+    ("# -*- coding: utf-7 -*-", [("code/eval", 4)]),
+    ("# vim: set fileencoding=latin-1 :", [("code/eval", 4)]),
+    ("# coding: no-such-codec", [("code/eval", 4)]),
+    # UTF-8 is what the parse reads, so the string is skipped as usual.
+    ("# -*- coding: utf-8 -*-", []),
+    ("# coding=UTF8", []),
+])
+def test_a_file_in_another_encoding_is_read_as_code_throughout(coding, expected):
+    assert found([coding, 'x = """', "+ACIAIgAi-", "eval(code)", '"""', "z = 1 #+ACIAIgAi-"]) == expected
+
+
+def test_a_line_the_file_text_disagrees_on_is_judged_as_the_diff_shows_it():
+    """The file's text is fetched separately and can be a push behind the
+    diff: where the two differ on a line, the diff's added line is checked
+    whole."""
+    text = diff("app.py", ["y = 1", "eval(code)"], new=True)
+    assert found_in(text, contents={"app.py": 'x = """\n"""\n'}) == [("code/eval", 2)]
+
+
 def test_a_string_reopened_where_one_closes_is_followed():
     assert found(['s = """a', 'b""" + """c', "never eval(x) here", '"""', "eval(y)"]) == [("code/eval", 5)]
 

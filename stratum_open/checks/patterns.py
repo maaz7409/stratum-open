@@ -14,6 +14,7 @@ language) is checked in full.
 from __future__ import annotations
 
 import ast
+import codecs
 import functools
 import re
 import warnings
@@ -69,7 +70,9 @@ def check(files: list[FileDiff], contents: dict[str, str] | None = None) -> list
         code_lines = {n: line[starts.get(n, 0):] for n, line in lines.items()} if starts else lines
         for number, text in added:
             findings.extend(_secrets(file.path, number, text, lines, test))
-            text = code_lines.get(number, text)
+            # The file's text can be a push behind the diff: trim only a line the two agree on.
+            if number in starts and lines.get(number) == text:
+                text = text[starts[number]:]
             if not text.strip() or is_comment(text) or len(text) > MAX_LINE:
                 continue
             if not test:
@@ -336,8 +339,11 @@ def _strings(text: str) -> tuple[tuple[int, int, str, str | None], ...]:
 
 
 # A Python file bigger than this isn't parsed to find its multi-line strings: it was generated,
-# and parsing it would cost more than the check.
-MAX_PARSE = 1_000_000
+# and parsing it would cost more than the check (about 80 MB of memory at this size).
+MAX_PARSE = 200_000
+# An encoding line (PEP 263), which Python reads on the first two lines. Matched in any case, so
+# it also stops on a few lines Python would ignore: skipping the parse is the safe direction.
+_ENCODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)", re.IGNORECASE)
 
 
 def _code_starts(lines: dict[int, str], whole: bool) -> dict[int, int]:
@@ -352,7 +358,7 @@ def _code_starts(lines: dict[int, str], whole: bool) -> dict[int, int]:
     than the Python running the review), nothing is listed and every line is
     read as code. A guess from part of the file, or a reading of the quotes
     that differs from Python's, would hide real calls whenever it was wrong."""
-    if not whole or list(lines) != list(range(1, len(lines) + 1)):
+    if not whole or list(lines) != list(range(1, len(lines) + 1)) or not _utf8(lines):
         return {}
     text = "\n".join(lines.values())
     if len(text) > MAX_PARSE or "\r" in text:  # a lone CR is a line break to Python, not to `view`
@@ -379,6 +385,21 @@ def _code_starts(lines: dict[int, str], whole: bool) -> dict[int, int]:
             starts[node.end_lineno] = len(end.encode()[:node.end_col_offset].decode(errors="ignore"))
         nodes.extend(ast.iter_child_nodes(node))
     return starts
+
+
+def _utf8(lines: dict[int, str]) -> bool:
+    """Whether Python reads the file as UTF-8, as the parse here does. Under
+    another encoding line the same bytes can be other code: in UTF-7,
+    `+ACIAIgAi-` is three double quotes, so a string the parse sees can end
+    early and what follows it runs."""
+    for number in (1, 2):
+        match = _ENCODING.match(lines.get(number, ""))
+        if match:
+            try:
+                return codecs.lookup(match.group(1)).name == "utf-8"
+            except LookupError:
+                return False
+    return True
 
 
 def _constant_command(lines: dict[int, str], number: int) -> bool:
