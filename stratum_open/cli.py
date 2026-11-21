@@ -222,6 +222,7 @@ def _review_local(args, base: str) -> int:
             contents[file.path] = text
     top = (_git_or_none(".", "rev-parse", "--show-toplevel") or ".").strip()
     result = analyze(
+        worktree=_local_worktree(policy, files, top),
         title=_git(".", "log", "-1", "--format=%s").strip(), description=_git(".", "log", "-1", "--format=%b").strip(),
         files=files, policy=policy, model=model, contents=contents or None,
         lookup=PackageLookup() if policy.dependencies.registry_lookup else None,
@@ -240,8 +241,38 @@ def _review_local(args, base: str) -> int:
         elif result.review is not None and result.review.summary:
             print(f"What this changes: {result.review.summary}\n")
     _print_findings(result.findings)
+    for note in result.check_notes:
+        print(note, file=sys.stderr)
     _write_json(args.json, result.findings)
     return 1 if any(f.severity == "critical" for f in result.findings) else 0
+
+
+def _local_worktree(policy: Policy, files: list, top: str):
+    """This checkout, for the checks that build the code (`checks.go_vet`,
+    `checks.clippy`). It builds here as `go build` or `cargo build` would,
+    running the code, so a line on stderr says so first: a branch checked out
+    from someone's PR is their code. It's refused when the checkout has
+    changes that aren't committed, files git doesn't know of included: the
+    review reads HEAD, and a build reads more than the changed files (their
+    package, the manifests, the dependencies)."""
+    from stratum_open.checks import clippy, go_vet
+    from stratum_open.checks.tools import Worktree, listed
+
+    if not (policy.checks.go_vet or policy.checks.clippy):
+        return None
+    if not any(f.status != "deleted" and (go_vet.wanted(f) or clippy.wanted(f)) for f in files):
+        return Worktree(top)  # nothing to build: the checks say nothing either way
+    status = _git_or_none(top, "status", "--porcelain", "--no-renames", "--untracked-files=all")
+    dirty = [line[3:] for line in (status or "").splitlines() if len(line) > 3]
+    if status is None:
+        return Worktree(top, "Stratum couldn't read `git status`, so it can't tell whether the checkout is the HEAD it reviews.")
+    if dirty:
+        return Worktree(top, f"{listed(dirty)} {'has' if len(dirty) == 1 else 'have'} changes that aren't committed, and the review "
+                             "reads HEAD. Commit or stash them, and run it again.")
+    # Said before anything is built: a branch checked out from someone else's PR is their code, and it runs here.
+    print(f"Building this checkout for {' and '.join(n for n, on in (('go vet', policy.checks.go_vet), ('Clippy', policy.checks.clippy)) if on)}, "
+          "which runs its code (build scripts, macros, cgo): don't do this on a checkout of a PR you don't trust.", file=sys.stderr)
+    return Worktree(top)
 
 
 def _print_findings(findings: list[Finding]) -> None:
