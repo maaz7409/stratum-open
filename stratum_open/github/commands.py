@@ -3,11 +3,12 @@
 A command starts a line: `/stratum review`. `@stratum` isn't one: GitHub links it
 to an unrelated organization of that name.
 
-Anyone can ask for help, the PR's triage or their own track record. An
-explanation or an answer to a question calls the model, so on a public repo it
-would let anyone make the maintainers' model server work: it's for the PR's
-author and people with write access, a few a day between the two. Changing
-what Stratum reports (re-review, ignore, mute) takes write access.
+By default, anyone can ask for help, the PR's triage or their own track
+record. An explanation or an answer to a question calls the model, so on a
+public repo it would let anyone make the maintainers' model server work: it's
+for the PR's author and people with write access, a few a day between the two.
+Changing what Stratum reports (re-review, ignore, mute) takes write access.
+The policy's `commands` changes who may run each, and `/stratum help` says so.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from stratum_open.diff import approx_tokens, parse_diff, render, sendable
 from stratum_open.github import publish
 from stratum_open.github.api import WRITE, GitHubError
+from stratum_open.policy import Commands
 from stratum_open.review import demention, parse, parse_with_rest  # noqa: F401  (parse: re-exported) It lives next to demention(), which keeps model text from matching it
 from stratum_open.runner import Context, excluded, from_fork, record_for, review_pull
 
@@ -45,17 +47,30 @@ _EXPLAINED = re.compile(r"<!-- stratum:(?:explained|asked) (\S+) -->")
 FINGERPRINT = re.compile(r"[0-9a-f]{12}")
 MAX_QUESTION = 1000  # characters in a `/stratum ask` question
 
-HELP = """Stratum commands, at the start of a line in a comment on this PR:
+# Who may run a command, as the help puts it, for each `commands` setting in the policy.
+_WHO = {"anyone": "anyone", "author": "the PR's author or write access", "write": "write access"}
 
-- `/stratum review`: review the whole PR again, not only what changed. *(write access)*
-- `/stratum ignore`: as a reply to one of Stratum's inline comments, hide that finding on this PR. *(write access)*
-- `/stratum ignore <rule>`: hide every finding of a rule on this PR, e.g. `/stratum ignore workflow/unpinned-action`. *(write access)*
+
+def help_text(commands: Commands) -> str:
+    """The commands, each with who may run it under the policy's `commands`."""
+    def who(command: str, also: str = "", *, unless: str | None = None) -> str:
+        setting = getattr(commands, command)
+        return "" if setting == unless else f" *({_WHO[setting]}{also})*"
+
+    return f"""Stratum commands, at the start of a line in a comment on this PR:
+
+- `/stratum review`: review the whole PR again, not only what changed.{who("review")}
+- `/stratum ignore`: as a reply to one of Stratum's inline comments, hide that finding on this PR.{who("ignore")}
+- `/stratum ignore <rule>`: hide every finding of a rule on this PR, e.g. `/stratum ignore workflow/unpinned-action`.{who("ignore")}
 - `/stratum ignore <fingerprint>` / `/stratum explain <fingerprint>`: the same as the replies, for the finding with that fingerprint, as a comment on the PR. An inline comment names its fingerprint where a reply can't reach Stratum: on a PR from a fork, with the GitHub Action.
-- `/stratum mute <rule>` / `/stratum unmute <rule>`: hide a rule on every PR in this repo. Needs the GitHub App, which can store it. *(write access)*
-- `/stratum explain`: as a reply to an inline comment, explain that finding in more detail. *(the PR's author or write access; a few a day)*
-- `/stratum ask <question>`: answer a question about this PR from its diff and review; as a reply to an inline comment, about that comment's code. *(the PR's author or write access; counts with explain)*
-- `/stratum triage`: why this PR got its triage label.
-- `/stratum record`: your own track record in this repo, from its git history."""
+- `/stratum mute <rule>` / `/stratum unmute <rule>`: hide a rule on every PR in this repo. Needs the GitHub App, which can store it.{who("mute")}
+- `/stratum explain`: as a reply to an inline comment, explain that finding in more detail.{who("explain", "; a few a day")}
+- `/stratum ask <question>`: answer a question about this PR from its diff and review; as a reply to an inline comment, about that comment's code.{who("explain", "; counts with explain")}
+- `/stratum triage`: why this PR got its triage label.{who("triage", unless="anyone")}
+- `/stratum record`: your own track record in this repo, from its git history.{who("record", unless="anyone")}"""
+
+
+HELP = help_text(Commands())  # with the default policy
 
 
 def handle(ctx: Context, event: str, payload: dict) -> str | None:
@@ -144,7 +159,7 @@ def handle(ctx: Context, event: str, payload: dict) -> str | None:
     if name == "record":
         reply(_record_text(ctx, author))
         return "record"
-    reply(HELP)
+    reply(help_text(ctx.policy.commands))
     return "help"
 
 

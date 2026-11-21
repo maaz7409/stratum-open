@@ -10,7 +10,8 @@ from dataclasses import replace
 import pytest
 
 from stratum_open.github import publish
-from stratum_open.github.commands import HELP, handle, parse
+from stratum_open.github.commands import HELP, handle, help_text, parse
+from stratum_open.policy import Commands
 from stratum_open.runner import review_pull
 
 from conftest import DIFF, SQL_LINE, head_of
@@ -250,6 +251,28 @@ def test_only_spaces_and_tabs_may_come_before_a_command(body, expected):
 ])
 def test_parse_skips_commands_in_code_blocks(body, expected):
     assert parse(body) == expected
+
+
+def test_help_says_who_may_run_each_command_as_the_policy_sets_it(reviewed, fake_github):
+    reviewed.policy = replace(reviewed.policy, commands=Commands(review="anyone", ignore="author", explain="write", record="write"))
+    handle(reviewed, *event("/stratum help", login="erin"))
+    notes = {line.split("`")[1]: line.rpartition("*(")[2].rstrip(")*") if line.endswith(")*") else None
+             for line in replies(fake_github)[-1].splitlines() if line.startswith("- `")}
+    assert notes == {
+        "/stratum review": "anyone",
+        "/stratum ignore": "the PR's author or write access",
+        "/stratum ignore <rule>": "the PR's author or write access",
+        "/stratum ignore <fingerprint>": None,
+        "/stratum mute <rule>": "write access",
+        "/stratum explain": "write access; a few a day",
+        "/stratum ask <question>": "write access; counts with explain",
+        "/stratum triage": None,
+        "/stratum record": "write access",
+    }
+    # erin has read access: what help says is what she can do.
+    assert handle(reviewed, *event("/stratum review", login="erin")) == "review"
+    assert handle(reviewed, *event("/stratum record", login="erin")) == "refused"
+    assert help_text(Commands()) == HELP
 
 
 @pytest.mark.parametrize("name", ["review", "re-review", "rereview", "ignore", "mute", "unmute", "explain", "triage", "record", "help"])
