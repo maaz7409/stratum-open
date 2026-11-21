@@ -41,7 +41,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from stratum_open.util import count
 
@@ -66,8 +66,9 @@ _PY_COMMENT_OR_STRING = re.compile(
 # The names run to the end of the line, or past it after a backslash.
 _PY_IMPORT = re.compile(r"^[ \t]*import[ \t]+((?:[^\n;#\\]|\\\r?\n)+)", re.M)
 _PY_FROM = re.compile(r"^[ \t]*from[ \t]+(\.*)[ \t]*([\w.]*)[ \t]+import[ \t]*(\([^)]*\)|(?:[^\n;#\\]|\\\r?\n)*)", re.M)
-_PY_CONTINUED = re.compile(r"\\\r?\n")
 _PY_NAME = re.compile(r"[\w.]+")
+_PY_LISTED = re.compile(r"[^,]+")  # one comma-separated entry of an import's names
+_PY_WORD = re.compile(r"[^\s()\\]+")  # an entry's first word: the name, before any `as`
 
 _JS_COMMENT_OR_STRING = re.compile(
     r"""//[^\n]*|/\*[\s\S]*?\*/|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`"""
@@ -87,6 +88,9 @@ class Import:
     module: str  # dotted for Python ("a.b"), the specifier for JS/TS ("../a/b")
     names: tuple[str, ...] = ()  # Python's `from module import names`
     level: int = 0  # Python's leading dots
+    # The line each of `names` is on, for a diff that adds one name to a
+    # statement spread over lines. Not part of what's imported, so not compared.
+    name_lines: tuple[int, ...] = field(default=(), compare=False)
 
 
 @dataclass
@@ -268,17 +272,27 @@ def _python_imports(text: str) -> list[Import]:
         if doubles % 2 or singles % 2:
             continue
         if match := _PY_IMPORT.match(text, start):
-            for part in _PY_CONTINUED.sub(" ", match.group(1)).split(","):
-                name = part.split()[0] if part.split() else ""
+            # Each module is on the line that names it, which a backslash can make a later one.
+            for name, at in _py_names(text, match, 1, line, start):
                 if _PY_NAME.fullmatch(name):
-                    found.append(Import(line, name.strip(".")))
+                    found.append(Import(at, name.strip(".")))
         elif match := _PY_FROM.match(text, start):
-            dots, module, names = match.groups()
+            dots, module = match.group(1, 2)
             if dots or module:
-                names = _PY_CONTINUED.sub(" ", names).strip().strip("()")
-                listed = tuple(n.split()[0] for n in names.split(",") if n.split() and n.split()[0].isidentifier())
-                found.append(Import(line, module.strip("."), listed, len(dots)))
+                listed = [(name, at) for name, at in _py_names(text, match, 3, line, start) if name.isidentifier()]
+                found.append(Import(line, module.strip("."), tuple(name for name, _ in listed), len(dots),
+                                    tuple(at for _, at in listed)))
     return found
+
+
+def _py_names(text: str, match: re.Match[str], group: int, line: int, start: int) -> Iterator[tuple[str, int]]:
+    """The first word of each comma-separated entry in `match`'s `group`, and
+    the line it's on, counting from `line` at offset `start`."""
+    offset = match.start(group)
+    for part in _PY_LISTED.finditer(match.group(group)):
+        if word := _PY_WORD.search(part.group()):
+            at = offset + part.start() + word.start()
+            yield word.group(), line + text.count("\n", start, at)
 
 
 def _js_imports(text: str) -> list[Import]:
