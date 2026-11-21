@@ -111,6 +111,9 @@ def test_extra_findings_guidance_and_exclusions():
 
 
 def test_a_model_that_raises_is_an_outage_or_a_bug_by_its_exception():
+    """Each call says which: the model not answering, or a bug (Stratum's own
+    `Model` raising anything else is one). Never the exception's message,
+    which may carry a secret; the traceback is kept for the log."""
     class Raising(FakeModel):
         failure_types = ()
 
@@ -130,13 +133,24 @@ def test_a_model_that_raises_is_an_outage_or_a_bug_by_its_exception():
         assert not result.review.ran and "Traceback" in call["traceback"]
         return call["error"]
 
-    assert error_of(Raising(ConnectionResetError("peer closed"))).startswith("the model step failed (ConnectionResetError)")
-    assert error_of(Raising(TimeoutError("slow"))).startswith("the model step failed (TimeoutError)")
-    assert error_of(Raising(OtherClientError("boom"))).startswith("Stratum hit a bug during the model step (OtherClientError)")
-    assert error_of(Raising(KeyError("file"))).startswith("Stratum hit a bug during the model step (KeyError)")
+    assert error_of(Raising(ConnectionResetError("peer closed"))) == "the model call failed (ConnectionResetError)"
+    assert error_of(Raising(TimeoutError("slow"))) == "the model call failed (TimeoutError)"
+    assert error_of(Raising(OtherClientError("boom"))) == "Stratum hit a bug during the model step (OtherClientError)"
+    assert error_of(Raising(KeyError("file"))) == "Stratum hit a bug during the model step (KeyError)"
     declared = Raising(OtherClientError("boom"))
     declared.failure_types = (OtherClientError,)
-    assert error_of(declared).startswith("the model step failed (OtherClientError)")
+    assert error_of(declared) == "the model call failed (OtherClientError)"
+
+
+def test_a_bug_in_the_model_step_itself_is_named_as_one(monkeypatch):
+    def broken(**kwargs):
+        raise KeyError("file")
+
+    monkeypatch.setattr("stratum_open.engine.review", broken)
+    result = run(FakeModel(reply(UNKNOWN_ID)))
+    [call] = result.review.calls
+    assert call["error"] == "Stratum hit a bug during the model step (KeyError): 'file'" and "Traceback" in call["traceback"]
+    assert not result.review.ran and {f.rule for f in result.findings} >= {"code/sql"}  # the checks still report
 
 
 def test_a_model_that_raises_in_the_verify_pass_keeps_the_finding():

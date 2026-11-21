@@ -139,7 +139,9 @@ def test_a_failed_call_and_a_model_that_raises():
 
     result = run(Raising(), "  file_reviews: 1\n  lens_files: 0\n")
     assert result.files[0].status == "failed" and not result.complete
-    assert result.calls[0]["error"] == "the model call failed (RuntimeError)"  # never the message, which may carry secrets
+    # A RuntimeError isn't the model failing to answer (see `is_model_failure`), and never the message, which may carry secrets.
+    assert result.calls[0]["error"] == "Stratum hit a bug during the model step (RuntimeError)"
+    assert "sk-secret-value" in result.calls[0]["traceback"]  # for the log, which redacts it
 
     result = run(FakeModel(Reply("", "m", 0, error="timed out")), "  file_reviews: 1\n  lens_files: 0\n")
     assert result.failed_calls == 1 and result.files[0].reason == "the model didn't answer for this file"

@@ -236,9 +236,12 @@ def review_pull(ctx: Context, number: int, *, full: bool = False, post: bool = T
         elif learned is not None and learned.rejected_on(finding) is not None:
             hidden.append(finding)
             gone.setdefault(finding.fingerprint, f"Hidden: maintainers rejected comments like this one {_on_prs(learned.rejected_on(finding), number)}.")
-    for call in (result.calls if result else []):
-        if call.get("traceback"):  # the model step raised: the summary gets the one-line error, the log the rest
-            ctx.log(redact(f"model review failed: {call.get('error', '')}\n{call['traceback']}"))
+    raised: dict[str, str] = {}  # a model call raised: the summary gets the one-line error, the log the rest, once per error
+    for call in (result.calls if result else []) + (engine.large.calls if engine.large else []):
+        if call.get("traceback"):
+            raised.setdefault(call.get("error", ""), call["traceback"])
+    for error, trace in raised.items():
+        ctx.log(redact(f"model review failed: {error}\n{trace}"))
     if result is not None:
         if result.calls and not result.ran:  # no calls: nothing it was given could be sent
             problems.extend(model_problems(sorted({c["error"] for c in result.calls if c.get("error")})))
@@ -805,7 +808,8 @@ def _coverage(result: ReviewResult | None, incremental: bool, changed: set[str] 
                 lines.append(f"The model read {sent}.")
             elif result.ran:
                 lines.append(f"Stratum sent the model {sent}; it read {read or 'none'} of them in full.")
-            else:
+            elif not all(str(c.get("error") or "").startswith("Stratum hit a bug") for c in result.calls):
+                # A bug of ours is said in the review's problems; "didn't answer" would dress it up as an outage.
                 lines.append(f"Stratum sent the model {sent}, but it didn't answer, so they weren't reviewed.")
         if packed.clipped:
             lines.append("Read in part (too big for one call): " + ", ".join(f"`{p}`" for p in packed.clipped[:10]))

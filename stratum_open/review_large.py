@@ -32,8 +32,8 @@ from stratum_open.findings import Finding, severity_rank, slug
 from stratum_open.model import Reply, parse_json, salvage
 from stratum_open.policy import Policy
 from stratum_open.review import (
-    GUIDANCE_CHARS, LEGEND, MAX_DESCRIPTION_CHARS, OUTPUT_RESERVE_TOKENS, _NARRATION, _one_per_claim, _text, _to_finding, demention,
-    one_line, shown,
+    GUIDANCE_CHARS, LEGEND, MAX_DESCRIPTION_CHARS, OUTPUT_RESERVE_TOKENS, _NARRATION, _one_per_claim, _text, _to_finding, call_model,
+    demention, one_line, shown,
 )
 
 REVIEW_MODES = {
@@ -248,17 +248,13 @@ def review_files(
         tasks += [_Task(file, lens, system, user) for lens, system in zip(lenses, systems)]
 
     answers: dict[str, list[dict[str, Any]]] = {}
-    for task, reply, error in _run(model, tasks, policy.review.parallel_calls):
-        call = reply.as_dict() if reply is not None else {
-            "model": str(getattr(model, "name", "")), "seconds": 0.0, "ok": False, "error": error,
-            "prompt_tokens": None, "output_tokens": None,
-        }
+    for task, reply, call in _run(model, tasks, policy.review.parallel_calls):
         call.update({"pass": "lens" if task.lens else "file", "path": task.file.path, "lens": task.lens or ""})
         result.calls.append(call)
-        if log and policy.review.log_prompts and reply is not None:
+        if log and policy.review.log_prompts:
             log(task.system + "\n\n" + task.user, reply.text)
-        data = parse_json(reply.text) if reply is not None and reply.ok else None
-        if not isinstance(data, dict) and reply is not None and reply.ok:
+        data = parse_json(reply.text) if reply.ok else None
+        if not isinstance(data, dict) and reply.ok:
             data = salvage(reply.text)
             if data is not None:
                 result.salvaged_calls += 1
@@ -297,14 +293,12 @@ def synthesize(large: LargeReview, findings: list[Finding], *, title: str, descr
         mode=_mode(policy), title=title, description=(description or "").strip()[:MAX_DESCRIPTION_CHARS] or "(no description)",
         findings=json.dumps(compact, indent=1) if compact else "(none)", files=json.dumps(summaries, indent=1) if summaries else "(none)",
     )
-    reply, error = _call(model, SYNTHESIS_SYSTEM, user, SYNTHESIS_TOKENS)
-    call = reply.as_dict() if reply is not None else {"model": str(getattr(model, "name", "")), "seconds": 0.0, "ok": False,
-                                                       "error": error, "prompt_tokens": None, "output_tokens": None}
+    reply, call = call_model(model, SYNTHESIS_SYSTEM, user, SYNTHESIS_TOKENS)
     call.update({"pass": "synthesis", "path": "", "lens": ""})
     large.calls.append(call)
-    if log and policy.review.log_prompts and reply is not None:
+    if log and policy.review.log_prompts:
         log(SYNTHESIS_SYSTEM + "\n\n" + user, reply.text)
-    data = parse_json(reply.text) if reply is not None and reply.ok else None
+    data = parse_json(reply.text) if reply.ok else None
     if not isinstance(data, dict):
         call["error"] = call["error"] or "the reply wasn't the JSON asked for"
         data = {}
@@ -371,18 +365,10 @@ def _file_notes(path: str, notes: Sequence[str], hotspots: set[str] | frozenset[
 # ── model calls ──────────────────────────────────────────────────────────
 
 
-def _call(model: Any, system: str, user: str, max_tokens: int) -> tuple[Reply | None, str]:
-    try:
-        return model.complete(system, user, max_tokens=max_tokens), ""
-    except Exception as exc:  # an embedder's model may raise; the engine's own reports failures in its Reply
-        return None, f"the model call failed ({type(exc).__name__})"
-
-
-def _run(model: Any, tasks: list[_Task], parallel: int) -> list[tuple[_Task, Reply | None, str]]:
-    """Every task's reply, in the tasks' order however many run at once."""
-    def one(task: _Task) -> tuple[_Task, Reply | None, str]:
-        reply, error = _call(model, task.system, task.user, OUTPUT_RESERVE_TOKENS)
-        return task, reply, error
+def _run(model: Any, tasks: list[_Task], parallel: int) -> list[tuple[_Task, Reply, dict[str, Any]]]:
+    """Every task's reply and its entry for `calls`, in the tasks' order however many run at once."""
+    def one(task: _Task) -> tuple[_Task, Reply, dict[str, Any]]:
+        return task, *call_model(model, task.system, task.user, OUTPUT_RESERVE_TOKENS)
 
     if parallel <= 1 or len(tasks) <= 1:
         return [one(task) for task in tasks]

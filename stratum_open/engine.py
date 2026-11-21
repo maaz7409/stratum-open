@@ -29,7 +29,7 @@ from stratum_open.diff import FileDiff, sendable
 from stratum_open.findings import Finding, anchor_to_diff, assign_fingerprints, dedupe, rank, risk_score, severity_rank
 from stratum_open.model import is_model_failure
 from stratum_open.policy import Policy
-from stratum_open.review import VERIFY_PROMPTS, ReviewResult, _locate, review, shown, verify_findings
+from stratum_open.review import VERIFY_PROMPTS, ReviewResult, _locate, failed_call, review, shown, verify_findings
 from stratum_open.review_large import LargeReview, review_files, synthesize
 
 
@@ -126,18 +126,16 @@ def analyze(
             )
         except Exception as exc:  # the model step is the one part of a review that may never stop the rest
             # Reported like any other failed call, so the review still says what happened; the traceback
-            # rides along for the caller's log and never reaches a comment. `Model.complete` already turns
-            # its own connection errors into failed calls, so what lands here from a model is an embedder's
-            # model raising; anything else is a bug of ours, and is named as one rather than as an outage.
+            # rides along for the caller's log and never reaches a comment. Each model call already turns
+            # a model that raises into a failed call (`review.call_model`), so what lands here is most
+            # likely a bug of ours, and is named as one rather than as an outage.
             if is_model_failure(exc, model):
                 error = f"the model step failed ({type(exc).__name__}): {exc}"
             else:
                 error = f"Stratum hit a bug during the model step ({type(exc).__name__}): {exc}"
-            result = ReviewResult(failed_calls=1, calls=[{
-                "model": str(getattr(model, "name", "")), "seconds": 0, "ok": False, "prompt_tokens": None, "output_tokens": None,
-                "error": error, "traceback": traceback.format_exc(),
-            }], unread={f.path for f in files  # no telling what was read, of what would have been sent
-                        if (only_paths is None or f.path in only_paths) and sendable(f, policy.ignored)})
+            result = ReviewResult(failed_calls=1, calls=[failed_call(model, error, traceback.format_exc())],
+                                  unread={f.path for f in files  # no telling what was read, of what would have been sent
+                                          if (only_paths is None or f.path in only_paths) and sendable(f, policy.ignored)})
 
     # The chunked review verifies its own findings; the per-file passes' go through the same check here.
     if large is not None and large.findings and policy.review.verify in VERIFY_PROMPTS:
